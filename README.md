@@ -48,6 +48,8 @@ Wichtig zu wissen:
 
 ## Installation
 
+➡️ **Schritt-für-Schritt-Anleitung: [QUICKSTART.md](QUICKSTART.md)**
+
 Voraussetzungen: Docker inkl. Compose-Plugin (v2), mind. 4 GB RAM (empfohlen mehr), Internetzugang zu Docker Hub und Maven Central.
 
 ```bash
