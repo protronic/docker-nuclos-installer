@@ -1,37 +1,87 @@
 #!/bin/bash
 
-# Installationsscript für Nuclos Docker Instanz
-# Erstellt: Jörg Staub - 15.09.2025
+# Installationsscript für eine Nuclos Docker-Instanz
+# auf Basis der offiziellen Docker-Hub-Images von nuccess:
+#   https://hub.docker.com/r/nuccess/nuclos-server
+#   https://hub.docker.com/r/nuccess/nuclos-db
 #
-# install.sh
+# Erstellt:      Jörg Staub - 15.09.2025
+# Überarbeitet:  09/2026 - Umstellung von "Installer-JAR + eigenem Image-Build"
+#                auf die fertigen nuccess-Images. Zusätzlich Vorbereitung für den
+#                Parallelbetrieb mit Sage 100 / MS-SQL (externe Datenbankverbindung).
+#
+# Wichtig zur Architektur:
+#   - Die nuccess-Images unterstützen als Nuclos-SYSTEMdatenbank ausschließlich
+#     PostgreSQL (Datenbank "nuclosdb", Benutzer "nuclos" sind im Image fest
+#     vorgegeben; nur Schema und Passwort sind konfigurierbar).
+#   - Die Sage-100-Daten (MS-SQL) werden NICHT als Systemdatenbank verwendet,
+#     sondern in Nuclos als EXTERNE Datenbankverbindung (JDBC) eingebunden.
+#     Dieses Script legt dafür den Microsoft-JDBC-Treiber in den
+#     Extensions-Ordner und gibt die fertige JDBC-URL aus.
+#
+# Aufruf:
+#   ./install.sh            normale Installation (Container werden gestartet)
+#   ./install.sh --no-start nur Konfiguration erzeugen, Container nicht starten
 
-# Funktion zur Suche nach einem freien Port ab 8080 ################################################
+# Parameter ######################################################################
+NO_START=0
+for arg in "$@"; do
+  case "$arg" in
+    --no-start) NO_START=1 ;;
+    -h|--help)
+      grep '^#' "$0" | head -30
+      exit 0
+      ;;
+  esac
+done
 
-# Check RAM ##########################################################################
+# Check RAM ######################################################################
 REQUIRED_MEMORY=4000  # 4GB in MB
 AVAILABLE_MEMORY=$(free -m | awk '/^Mem:/{print $2}')
 if (( AVAILABLE_MEMORY < REQUIRED_MEMORY )); then
-    echo "⚠️ Warning: System has less than 4GB RAM"
+    echo "⚠️  Warnung: System hat weniger als 4GB RAM"
 fi
 
-# Check Docker installation ##########################################################################
+# Check Docker Installation ######################################################
 if ! command -v docker >/dev/null 2>&1; then
-    echo "❌ Docker is not installed"
+    if [[ $NO_START -eq 1 ]]; then
+        echo "⚠️  Docker ist nicht installiert (wegen --no-start nur Warnung)"
+    else
+        echo "❌ Docker ist nicht installiert"
+        exit 1
+    fi
+elif ! docker info >/dev/null 2>&1; then
+    if [[ $NO_START -eq 1 ]]; then
+        echo "⚠️  Docker-Daemon läuft nicht (wegen --no-start nur Warnung)"
+    else
+        echo "❌ Docker-Daemon läuft nicht"
+        exit 1
+    fi
+elif ! docker compose version >/dev/null 2>&1; then
+    echo "❌ Docker Compose v2 (docker compose) ist nicht verfügbar"
     exit 1
 fi
 
-if ! docker info >/dev/null 2>&1; then
-    echo "❌ Docker daemon is not running"
-    exit 1
+if [[ $EUID -ne 0 ]]; then
+    echo "⚠️  Script läuft nicht als root - Verzeichnisrechte (chown) werden ggf. per sudo gesetzt"
 fi
 
-default_javaversion=11
-default_pgversion=17
-default_nuclosinstanz=snnuc
+# Defaults #######################################################################
 default_prefix=nuc
-default_database=nuclosdb
-default_dbuser=nuclos
-default_dbpassword=nuclos
+default_server_tag=latest        # zum Festpinnen z.B. 4.2026.28
+default_db_tag=17.6              # PostgreSQL-Version des nuccess/nuclos-db Images
+default_schema=nuclos
+default_ram_server=4
+default_ram_db=2
+default_tz=Europe/Berlin
+default_locale=de_DE.UTF-8
+default_mssql_port=1433
+default_mssql_db=SageDB
+MSSQL_JDBC_VERSION=13.6.0.jre11  # Microsoft JDBC-Treiber (Java 11+, passend zu Java 17 im Image)
+
+# Feste Vorgaben der nuccess-Images (nicht änderbar):
+NUCLOS_DB_NAME=nuclosdb
+NUCLOS_DB_USER=nuclos
 
 TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
 # Setup logging
@@ -40,81 +90,136 @@ mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/nuclos_install_${TIMESTAMP}.log"
 exec 1> >(tee -a "$LOG_FILE") 2>&1
 
-echo "=== Nuclos Installation Log ===" 
+echo "=== Nuclos Installation Log ==="
 echo "Date: ${TIMESTAMP}"
 echo "System: $(uname -a)"
-echo "==========================="
+echo "==============================="
+
+# Hilfsfunktionen ################################################################
+port_in_use() {
+  local p=$1
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -iTCP -sTCP:LISTEN -Pn 2>/dev/null | grep -qE ":${p}\b"
+  else
+    ss -tln 2>/dev/null | grep -qE ":${p}\b"
+  fi
+}
 
 find_free_port() {
   local port=8080
-  while lsof -iTCP -sTCP:LISTEN -Pn | grep ":$port" > /dev/null; do
+  while port_in_use "$port"; do
     ((port++))
   done
   echo $port
 }
 
+gen_password() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 12
+  else
+    tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24
+  fi
+}
+
+as_root() {
+  if [[ $EUID -eq 0 ]]; then
+    "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+  else
+    echo "⚠️  Bitte manuell als root ausführen: $*"
+    return 1
+  fi
+}
+
+download() {
+  # download <url> <ziel>
+  if command -v curl >/dev/null 2>&1; then
+    curl -fL --retry 3 -o "$2" "$1"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -O "$2" "$1"
+  else
+    echo "❌ Weder curl noch wget vorhanden"
+    return 1
+  fi
+}
+
 clear
 set -e
 echo "-----------------------------------------------------------"
-echo "Nuclos Docker-Instanz Setup"
-echo "Dieses Script erzeugt automatische .env, Dockerfile, "
-echo "docker-compose.yml und die Nuclos Konfigurationsdatei "
-echo "sowie einige Backup- und Restorescripte"
+echo "Nuclos Docker-Instanz Setup (nuccess/nuclos-server)"
+echo "Dieses Script erzeugt automatisch .env, docker-compose.yml,"
+echo "das Secrets-Verzeichnis sowie Backup-, Restore-, Upgrade-"
+echo "und Uninstall-Scripte."
 echo "-----------------------------------------------------------"
 echo "Folgende Container werden erzeugt:"
-echo "Postgresql, Nuclos "
+echo "  nuccess/nuclos-db     (PostgreSQL Systemdatenbank)"
+echo "  nuccess/nuclos-server (Nuclos Applikationsserver)"
+echo "Es wird KEIN Installer-JAR und KEIN lokaler Image-Build mehr benötigt."
 echo "-----------------------------------------------------------"
 
-echo "> Docker Parameter ---------------------------------------------------"
-read -p "Image-Tag für Docker Build (z.B. dev, test, prod) (default=-dev): " IMAGE_TAG
-IMAGE_TAG=${IMAGE_TAG:-dev}
-read -p "Docker Container-Präfix [Enter für $default_prefix]: " PREFIX
-PREFIX=${PREFIX:-$default_prefix}
-
-
-
-
-# Parameter abfragen ##############################################################################
-echo "> Datenbank Parameter -----------------------------------------------------"
-read -p "PostgreSQL Version (z.B. 17) [Enter für $default_pgversion]: " PG_VERSION
-PG_VERSION=${PG_VERSION:-$default_pgversion}
-
-read -p "Datenbankname [Enter für $default_database]: " POSTGRES_DB
-POSTGRES_DB=${POSTGRES_DB:-$default_database}
-read -p "Datenbank Benutzername [Enter für $default_dbuser]: " POSTGRES_USER
-POSTGRES_USER=${POSTGRES_USER:-$default_dbuser}
-read -p "Datenbank Passwort [Enter für $default_dbpassword]: " POSTGRES_PASSWORD
-POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-$default_dbpassword}
-
-
-# Add after database parameter collection
-if [[ "$POSTGRES_USER" == "nuclos" && "$POSTGRES_PASSWORD" == "nuclos" ]]; then
-    echo "⚠️ Warning: Using default credentials is not recommended for production"
-    read -p "Continue anyway? (y/N): " confirm
-    [[ $confirm != "y" ]] && exit 1
+if [[ -f docker-compose.yml || -f .env ]]; then
+  echo "⚠️  In diesem Verzeichnis existiert bereits eine Konfiguration"
+  echo "   (.env / docker-compose.yml). Sie wird überschrieben,"
+  echo "   vorhandene Datenverzeichnisse bleiben erhalten."
+  read -p "Fortfahren? (ja/nein): " confirm
+  [[ "$confirm" == "ja" ]] || exit 1
 fi
 
+# Parameter abfragen #############################################################
+echo "> Docker Parameter --------------------------------------------------------"
+read -p "Docker Container-Präfix [Enter für $default_prefix]: " PREFIX
+PREFIX=${PREFIX:-$default_prefix}
+PREFIX=$(echo "$PREFIX" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-')
+[[ -n "$PREFIX" ]] || PREFIX=$default_prefix
+echo "Verwendeter Präfix: $PREFIX"
 
+echo "> Nuclos Versionen --------------------------------------------------------"
+echo "Verfügbare Tags: https://hub.docker.com/r/nuccess/nuclos-server/tags"
+read -p "Nuclos-Server Tag (z.B. 4.2026.28) [Enter für $default_server_tag]: " NUCLOS_SERVER_TAG
+NUCLOS_SERVER_TAG=${NUCLOS_SERVER_TAG:-$default_server_tag}
+read -p "Nuclos-DB Tag (PostgreSQL, z.B. 17.6) [Enter für $default_db_tag]: " NUCLOS_DB_TAG
+NUCLOS_DB_TAG=${NUCLOS_DB_TAG:-$default_db_tag}
 
+echo "> Datenbank Parameter -----------------------------------------------------"
+echo "Hinweis: Datenbankname ($NUCLOS_DB_NAME) und Benutzer ($NUCLOS_DB_USER) sind"
+echo "durch die nuccess-Images fest vorgegeben. Konfigurierbar sind Schema und Passwort."
+read -p "Datenbank-Schema der Instanz [Enter für $default_schema]: " DB_SCHEMA
+DB_SCHEMA=${DB_SCHEMA:-$default_schema}
+DB_SCHEMA=$(echo "$DB_SCHEMA" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_')
+[[ -n "$DB_SCHEMA" ]] || DB_SCHEMA=$default_schema
 
-echo "> JAVA Parameter ----------------------------------------------------------"
-read -p "Java Version (zurzeit 11 empfohlen) [Enter für $default_javaversion]: " JAVA_VERSION
-JAVA_VERSION=${JAVA_VERSION:-$default_javaversion}
+generated_password=$(gen_password)
+read -p "Datenbank Passwort [Enter für generiertes: $generated_password]: " DB_PASSWORD
+DB_PASSWORD=${DB_PASSWORD:-$generated_password}
+if [[ "$DB_PASSWORD" == "password" ]]; then
+    echo "⚠️  Warnung: 'password' ist das Default-Passwort der Images und für Produktion ungeeignet"
+    read -p "Trotzdem fortfahren? (y/N): " confirm
+    [[ $confirm == "y" ]] || exit 1
+fi
 
-echo "> Nuclos Parameter --------------------------------------------------------"
-read -p "Nuclos Instanzname [Enter für $default_nuclosinstanz]: " NUCLOS_INSTANZ
-NUCLOS_INSTANZ=${NUCLOS_INSTANZ:-$default_nuclosinstanz}
+echo "> Ressourcen --------------------------------------------------------------"
+read -p "RAM für Nuclos-Server in GB [Enter für $default_ram_server]: " NUCLOS_RAM_GB
+NUCLOS_RAM_GB=${NUCLOS_RAM_GB:-$default_ram_server}
+read -p "RAM für Datenbank in GB [Enter für $default_ram_db]: " DB_RAM_GB
+DB_RAM_GB=${DB_RAM_GB:-$default_ram_db}
 
+echo "> Lokalisierung -----------------------------------------------------------"
+read -p "Zeitzone [Enter für $default_tz]: " TZ_VALUE
+TZ_VALUE=${TZ_VALUE:-$default_tz}
+read -p "Locale [Enter für $default_locale]: " LOCALE_VALUE
+LOCALE_VALUE=${LOCALE_VALUE:-$default_locale}
 
-# Port automatisch vorschlagen ####################################################################
+# Port automatisch vorschlagen ###################################################
 default_port=$(find_free_port)
+echo "> Netzwerk ----------------------------------------------------------------"
 echo "Vorgeschlagener freier Port: $default_port"
 
 while true; do
   read -p "Freier HTTP-Port für Nuclos [Enter für $default_port]: " NUCLOS_PORT
   NUCLOS_PORT=${NUCLOS_PORT:-$default_port}
 
-  if lsof -iTCP -sTCP:LISTEN -Pn | grep ":$NUCLOS_PORT" > /dev/null; then
+  if port_in_use "$NUCLOS_PORT"; then
     echo "❌ Port $NUCLOS_PORT ist bereits belegt. Bitte einen anderen wählen."
   else
     echo "✅ Port $NUCLOS_PORT ist frei."
@@ -122,437 +227,538 @@ while true; do
   fi
 done
 
+# Sage 100 / MS-SQL Anbindung ####################################################
+echo "> Sage 100 / MS-SQL -------------------------------------------------------"
+echo "Nuclos läuft parallel zu Sage 100. Die Sage-Datenbank (MS-SQL) wird in"
+echo "Nuclos als externe Datenbankverbindung (JDBC) eingebunden - dafür wird der"
+echo "Microsoft-JDBC-Treiber in den Extensions-Ordner des Servers gelegt."
+read -p "Sage 100 / MS-SQL Anbindung vorbereiten? (J/n): " MSSQL_PREP
+MSSQL_PREP=${MSSQL_PREP:-J}
 
+SAGE_MSSQL_HOST=""
+SAGE_MSSQL_PORT=""
+SAGE_MSSQL_DB=""
+if [[ "$MSSQL_PREP" =~ ^[JjYy] ]]; then
+  echo "Der MS-SQL-Server (Sage 100) läuft auf einem ANDEREN Server:"
+  echo "Hostname oder IP dieses Servers angeben - er muss vom Docker-Host aus"
+  echo "über den MS-SQL-Port erreichbar sein (Firewall!)."
+  echo "(Sonderfall: läuft MS-SQL doch auf dem Docker-Host selbst,"
+  echo " 'host.docker.internal' eintragen.)"
+  read -p "MS-SQL Host (Hostname/IP des Sage-100-Servers): " SAGE_MSSQL_HOST
+  read -p "MS-SQL Port [Enter für $default_mssql_port]: " SAGE_MSSQL_PORT
+  SAGE_MSSQL_PORT=${SAGE_MSSQL_PORT:-$default_mssql_port}
+  read -p "Sage 100 Datenbankname [Enter für $default_mssql_db]: " SAGE_MSSQL_DB
+  SAGE_MSSQL_DB=${SAGE_MSSQL_DB:-$default_mssql_db}
 
-# .env erzeugen ##################################################################################
+  if [[ -z "$SAGE_MSSQL_HOST" ]]; then
+    echo "ℹ️  Kein Host angegeben - die Verbindungsdaten können später direkt"
+    echo "   in Nuclos hinterlegt werden."
+  elif [[ "$SAGE_MSSQL_HOST" != "host.docker.internal" ]]; then
+    echo "Prüfe Erreichbarkeit von ${SAGE_MSSQL_HOST}:${SAGE_MSSQL_PORT} ..."
+    if timeout 5 bash -c "exec 3<>/dev/tcp/${SAGE_MSSQL_HOST}/${SAGE_MSSQL_PORT} && exec 3>&-" 2>/dev/null; then
+      echo "✅ ${SAGE_MSSQL_HOST}:${SAGE_MSSQL_PORT} ist vom Docker-Host aus erreichbar."
+    else
+      echo "⚠️  ${SAGE_MSSQL_HOST}:${SAGE_MSSQL_PORT} ist aktuell NICHT erreichbar."
+      echo "   Bitte prüfen: Firewall-Freigabe vom Docker-Host, TCP/IP im"
+      echo "   SQL Server Configuration Manager, Namensauflösung."
+      echo "   (Die Installation läuft trotzdem weiter.)"
+    fi
+  fi
+fi
 
+# Verzeichnisse anlegen ##########################################################
+echo "Lege Verzeichnisse an..."
+mkdir -p nuclos-pgdata
+mkdir -p nuclos-db-exchange
+mkdir -p nuclos-data/documents nuclos-data/index nuclos-data/logs nuclos-data/nucletimport
+mkdir -p nuclos-extensions/server nuclos-extensions/client nuclos-extensions/common
+mkdir -p nuclos-backups
+mkdir -p nuclos-control
+mkdir -p secrets
+
+# Rechte passend zu den Container-Benutzern setzen:
+#   nuclos-db     läuft als postgres (uid 999, gid 999)
+#   nuclos-server läuft als nuclos   (uid 1000, gid 1000)
+#   /var/nuclos-db wird von beiden genutzt (999:1000, 770)
+echo "Setze Verzeichnisrechte (Container-UIDs 999/1000)..."
+as_root chown 999:999 nuclos-pgdata || true
+as_root chmod 700 nuclos-pgdata || true
+as_root chown 999:1000 nuclos-db-exchange || true
+as_root chmod 770 nuclos-db-exchange || true
+as_root chown -R 1000:1000 nuclos-data nuclos-extensions nuclos-backups nuclos-control || true
+
+# Secrets ########################################################################
+echo "Erzeuge Secrets-Datei ./secrets/db_password ..."
+printf '%s' "$DB_PASSWORD" > secrets/db_password
+as_root chown -R 999:1000 secrets || true
+as_root chmod 750 secrets || true
+as_root chmod 640 secrets/db_password || true
+
+# .gitignore erzeugen ############################################################
+# Falls das Installationsverzeichnis (auch) ein Git-Repo ist: Secrets,
+# Laufzeitdaten und generierte Dateien dürfen niemals eingecheckt werden.
+if [[ ! -f .gitignore ]]; then
+cat > .gitignore <<'EOF'
+# Von install.sh erzeugte Dateien und Laufzeitdaten - niemals committen!
+secrets/
+.env
+docker-compose.yml
+logs/
+nuclos-pgdata/
+nuclos-data/
+nuclos-extensions/
+nuclos-backups/
+nuclos-db-backups/
+nuclos-db-exchange/
+nuclos-control/
+nuclos-instanzbackup/
+nuclos-archiv/
+backup-*.tar.gz
+*.backup
+# generierte Hilfsscripte
+uninstall.sh
+backup-db.sh
+backup-instanz.sh
+restore-instanz.sh
+upgrade.sh
+EOF
+echo "Erzeuge .gitignore (Secrets/Laufzeitdaten vom Einchecken ausgeschlossen)"
+fi
+
+# .env erzeugen ##################################################################
 cat > .env <<EOF
-# Generated .env 
+# Generated .env
 # Installation: ${TIMESTAMP}
 #
-# Versionen
-PG_VERSION=${PG_VERSION}
-JAVA_VERSION=${JAVA_VERSION}
-# Docker Container Namen
-DOCKER_CONTAINER_PG=${PREFIX}-postgres
-DOCKER_CONTAINER_NUCLOS=${PREFIX}-server
+# Docker
+PREFIX="${PREFIX}"
+# Image-Tags (https://hub.docker.com/r/nuccess/nuclos-server/tags)
+NUCLOS_SERVER_TAG="${NUCLOS_SERVER_TAG}"
+NUCLOS_DB_TAG="${NUCLOS_DB_TAG}"
 # Nuclos
-NUCLOS_INSTANZ=${NUCLOS_INSTANZ}
-NUCLOS_PORT=${NUCLOS_PORT}
-# Datenbank
-POSTGRES_DB=${POSTGRES_DB}
-POSTGRES_USER=${POSTGRES_USER}
-POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+NUCLOS_PORT="${NUCLOS_PORT}"
+DB_SCHEMA="${DB_SCHEMA}"
+NUCLOS_RAM_GB="${NUCLOS_RAM_GB}"
+DB_RAM_GB="${DB_RAM_GB}"
+LIVE_SEARCH="false"
+TZ="${TZ_VALUE}"
+LOCALE="${LOCALE_VALUE}"
+# Datenbank (durch die nuccess-Images fest vorgegeben)
+# Datenbankname: ${NUCLOS_DB_NAME} / Benutzer: ${NUCLOS_DB_USER}
+# Das DB-Passwort steht NICHT hier, sondern in ./secrets/db_password
+#
+# Sage 100 / MS-SQL (nur Referenz - die Verbindung wird in Nuclos konfiguriert)
+SAGE_MSSQL_HOST="${SAGE_MSSQL_HOST}"
+SAGE_MSSQL_PORT="${SAGE_MSSQL_PORT}"
+SAGE_MSSQL_DB="${SAGE_MSSQL_DB}"
 EOF
 
+# docker-compose.yml erzeugen ####################################################
+# Hinweise:
+#  - Der Nuclos-Server erwartet die Datenbank fest unter dem Hostnamen "postgres"
+#    (Netzwerk-Alias), Port 5432, Datenbank "nuclosdb", Benutzer "nuclos".
+#  - /var/nuclos-db ist das gemeinsame Austauschverzeichnis von Server und DB
+#    (Schema-Anlage, DockerBackup/DockerRestore) und MUSS geteilt werden.
+#  - Der PostgreSQL-Port wird bewusst NICHT am Host veröffentlicht.
+#  - Der MS-SQL-Server (Sage 100) läuft auf einem anderen Server und wird über
+#    das normale Netzwerk erreicht. host.docker.internal ist nur der Sonderfall
+#    "MS-SQL läuft auf dem Docker-Host selbst".
+cat > docker-compose.yml <<'EOF'
+name: ${PREFIX}-nuclos
 
-# Dockerfile erzeugen #############################################################################
-
-cat > Dockerfile <<EOF
-FROM eclipse-temurin:${JAVA_VERSION}-jdk
-WORKDIR /opt/nuclos-install
-
-RUN apt-get update && apt-get install -y postgresql-client
-RUN apt-get update && apt-get install -y ncat nano
-RUN apt-get update && apt-get install -y locales && locale-gen de_DE.UTF-8
-ENV LANG = "de_DE.UTF-8"
-ENV POSTGRES_INITDB_ARGS="--locale=de_DE.UTF-8"
-
-
-COPY nuclos-*.jar ./nuclos-installer.jar
-COPY nuclos-install-config.xml ./install-config.xml
-
-RUN java -jar nuclos-installer.jar -s install-config.xml
-EOF
-
-
-# docker-compose.yml erzeugen #####################################################################
-
-cat > docker-compose.yml <<EOF
 networks:
-  ${PREFIX}-nuclos-net:
+  nuclos-net:
     driver: bridge
+
 services:
-  ${PREFIX}-postgres:
-    image: postgres:\${PG_VERSION}
-    container_name: ${PREFIX}-postgres
+  db:
+    image: nuccess/nuclos-db:${NUCLOS_DB_TAG}
+    container_name: ${PREFIX}-db
     restart: unless-stopped
     environment:
-      - POSTGRES_DB=\${POSTGRES_DB}
-      - POSTGRES_USER=\${POSTGRES_USER}
-      - POSTGRES_PASSWORD=\${POSTGRES_PASSWORD}
+      TZ: ${TZ}
+      LOCALE: ${LOCALE}
+      TOTAL_RAM_GB: ${DB_RAM_GB}
     volumes:
-      - ./nuclos-pgdata:/var/lib/postgresql/data
-    ports:
-      - "5432"
+      - ./nuclos-pgdata:/var/lib/postgresql/nuclos
+      - ./nuclos-db-exchange:/var/nuclos-db
+      - ./secrets:/opt/nuclos/secrets:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U \${POSTGRES_USER} -d \${POSTGRES_DB}"]
-      interval: 5s
+      test: ["CMD-SHELL", "pg_isready -U nuclos -d nuclosdb"]
+      interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 60s
     networks:
-      - ${PREFIX}-nuclos-net
+      nuclos-net:
+        aliases:
+          - postgres
 
-  ${PREFIX}-server:
-    # build: .
-    image: snnuclos:${IMAGE_TAG}
+  server:
+    image: nuccess/nuclos-server:${NUCLOS_SERVER_TAG}
     container_name: ${PREFIX}-server
-    ports:
-      - "\${NUCLOS_PORT}:80"
     restart: unless-stopped
     depends_on:
-      ${PREFIX}-postgres:
+      db:
         condition: service_healthy
+    ports:
+      - "${NUCLOS_PORT}:8080"
     environment:
-      - DB_HOST=${PREFIX}-postgres
-      - DB_PORT=5432
-      - DB_NAME=\${POSTGRES_DB}
-      - DB_USER=\${POSTGRES_USER}
-      - DB_PASSWORD=\${POSTGRES_PASSWORD}
+      DOCKER_NUCLOS_PORT: ${NUCLOS_PORT}
+      DB_SCHEMA: ${DB_SCHEMA}
+      TOTAL_RAM_GB: ${NUCLOS_RAM_GB}
+      LIVE_SEARCH: ${LIVE_SEARCH}
+      TZ: ${TZ}
+      LOCALE: ${LOCALE}
     volumes:
-      - ./nuclos-data/documents-upload:/opt/nuclos/data/documents-upload
-      - ./nuclos-data/documents:/opt/nuclos/data/documents
-      - ./nuclos-data/index:/opt/nuclos/data/index
-    entrypoint: /opt/nuclos/bin/launchd.sh
+      - ./nuclos-data/documents:/opt/nuclos/home/data/documents
+      - ./nuclos-data/index:/opt/nuclos/home/data/index
+      - ./nuclos-data/logs:/opt/nuclos/home/logs
+      - ./nuclos-data/nucletimport:/opt/nuclos/home/data/nucletimport
+      - ./nuclos-backups:/opt/nuclos/backups
+      - ./nuclos-extensions:/opt/nuclos/extensions
+      - ./nuclos-control:/opt/nuclos/control
+      - ./nuclos-db-exchange:/var/nuclos-db
+      - ./secrets:/opt/nuclos/secrets:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      # Prüft nur, ob Tomcat lauscht. Der Erststart (AutoDbSetup) kann
+      # mehrere Minuten dauern, daher grosszügige start_period.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && exec 3>&-"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 1800s
     networks:
-      - ${PREFIX}-nuclos-net
+      - nuclos-net
 EOF
 
-# nuclos-install-config.xml erzeugen #############################################################
+# MS-SQL JDBC-Treiber für Sage 100 Anbindung #####################################
+if [[ "$MSSQL_PREP" =~ ^[JjYy] ]]; then
+  JDBC_JAR="nuclos-extensions/server/mssql-jdbc-${MSSQL_JDBC_VERSION}.jar"
+  JDBC_URL="https://repo1.maven.org/maven2/com/microsoft/sqlserver/mssql-jdbc/${MSSQL_JDBC_VERSION}/mssql-jdbc-${MSSQL_JDBC_VERSION}.jar"
+  if [[ -f "$JDBC_JAR" ]]; then
+    echo "✅ MS-SQL JDBC-Treiber bereits vorhanden: $JDBC_JAR"
+  else
+    echo "Lade Microsoft JDBC-Treiber ${MSSQL_JDBC_VERSION} herunter..."
+    if download "$JDBC_URL" "$JDBC_JAR"; then
+      as_root chown 1000:1000 "$JDBC_JAR" || true
+      echo "✅ Treiber gespeichert: $JDBC_JAR"
+      echo "   (wird beim Serverstart automatisch in den Nuclos-Classpath übernommen)"
+    else
+      echo "⚠️  Download fehlgeschlagen. Bitte manuell laden:"
+      echo "   $JDBC_URL"
+      echo "   und nach $JDBC_JAR kopieren."
+    fi
+  fi
+fi
 
-cat > nuclos-install-config.xml <<EOF
-<?xml version="1.0"?>
-<nuclos>
-  <server>
-    <home>/opt/nuclos</home>
-    <name>${NUCLOS_INSTANZ}</name>
-    <http>
-      <enabled>true</enabled>
-      <port>80</port>
-    </http>
-    <shutdown-port>8005</shutdown-port>
-    <heap-size>2048</heap-size>
-    <java-home></java-home>
-    <launch-on-startup>true</launch-on-startup>
-  </server>
-  <database>
-    <adapter>postgresql</adapter>
-    <driver>org.postgresql.Driver</driver>
-    <driverjar>/opt/nuclos/lib/postgresql.jar</driverjar>
-    <connection-url>jdbc:postgresql://${PREFIX}-postgres:5432/${POSTGRES_DB}</connection-url>
-    <username>${POSTGRES_USER}</username>
-    <password>${POSTGRES_PASSWORD}</password>
-    <schema>${POSTGRES_DB}</schema>
-    <tablespace></tablespace>
-  </database>
-</nuclos>
-EOF
-
-# nuclos uninstallscript ##############################################################################
-
-cat > uninstall.sh <<EOF
+# nuclos uninstallscript #########################################################
+cat > uninstall.sh <<'EOF'
 #!/bin/bash
 set -e
-# Uninstall-Skript für Nuclos Docker Instanz
-# Erstellt: Jörg Staub - 08.11.2025
-TIMESTAMP=\$(date +"%Y-%m-%d_%H-%M-%S")
+# Uninstall-Script für Nuclos Docker-Instanz
+cd "$(dirname "$0")"
+TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
 echo "⚠️  Achtung: Diese Aktion entfernt alle Nuclos-Docker-Komponenten und Daten!"
 read -p "Bist du sicher? (ja/nein): " confirm
-if [[ "\${confirm}" != "ja" ]]; then
+if [[ "${confirm}" != "ja" ]]; then
   echo "Abbruch durch Benutzer."
   exit 1
 fi
 
-# Container-Präfix aus .env laden
-if [[ -f .env ]]; then
-  export \$(grep -v '^#' .env | xargs)
-else
+if [[ ! -f .env ]]; then
   echo "❌ .env-Datei nicht gefunden. Abbruch."
   exit 1
 fi
+set -a; source ./.env; set +a
 
 echo "🧨 Stoppe und entferne Container..."
 docker compose down --volumes --remove-orphans
 
-
 echo "🧨 Packe Datenverzeichnis..."
-tar -czvf backup-nuclos-data\$TIMESTAMP.tar.gz ./nuclos-data
+tar -czf "backup-nuclos-data${TIMESTAMP}.tar.gz" ./nuclos-data ./nuclos-extensions ./nuclos-backups
 echo "🧨 Packe Datenbankverzeichnis..."
-tar -czvf backup-nuclos-pgdata\$TIMESTAMP.tar.gz ./nuclos-pgdata
-echo "🧨 Packe .env"
-tar -czvf backup-nuclos-environment\$TIMESTAMP.tar.gz ".env"
-echo "🧨 Packe nuclos-config"
-tar -czvf backup-nuclos-config\$TIMESTAMP.tar.gz "nuclos-install-config.xml"
-
+tar -czf "backup-nuclos-pgdata${TIMESTAMP}.tar.gz" ./nuclos-pgdata
+echo "🧨 Packe Konfiguration (.env, docker-compose.yml, secrets)..."
+tar -czf "backup-nuclos-config${TIMESTAMP}.tar.gz" .env docker-compose.yml secrets
 
 echo "🧹 Entferne lokale Datenverzeichnisse..."
-rm -rf nuclos-pgdata nuclos-data
+rm -rf nuclos-pgdata nuclos-data nuclos-extensions nuclos-backups nuclos-db-exchange nuclos-control secrets
 
 echo "🗑️ Entferne Konfigurationsdateien..."
-rm -f .env docker-compose.yml Dockerfile nuclos-install-config.xml uninstall.sh backup-db.sh
+rm -f .env docker-compose.yml uninstall.sh backup-db.sh backup-instanz.sh restore-instanz.sh upgrade.sh
 
 echo "✅ Nuclos-Docker-Instanz wurde vollständig entfernt."
+echo "   Die backup-*.tar.gz Dateien bleiben zur Sicherheit liegen."
 EOF
 
-# ###################################################################################################
-# ###################################################################################################
-# BACKUP SCRIPTS ####################################################################################
-# nuclos db backupscript ############################################################################
-
-cat > backup-db.sh <<EOF
+# ################################################################################
+# BACKUP SCRIPTS #################################################################
+# nuclos db backupscript #########################################################
+cat > backup-db.sh <<'EOF'
 #!/bin/bash
 set -e
-# Konfiguration
-CONTAINER_NAME=${PREFIX}-postgres
-DB_USER=${POSTGRES_USER}
-BACKUP_DIR="./nuclos-backups"
-TIMESTAMP=\$(date +"%Y-%m-%d_%H-%M-%S")
+# Datenbank-Backup (pg_dump, Custom-Format) der Nuclos-Systemdatenbank
+cd "$(dirname "$0")"
+set -a; source ./.env; set +a
+
+CONTAINER_NAME=${PREFIX}-db
+BACKUP_DIR="./nuclos-db-backups"
+TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
 
 # Backup-Verzeichnis sicherstellen
-mkdir -p "\$BACKUP_DIR"
+mkdir -p "$BACKUP_DIR"
 
-# Backup ausführen
-echo "Sichere Datenabnk..."
-docker exec "\$CONTAINER_NAME" pg_dumpall -U "\$DB_USER" | gzip > "\$BACKUP_DIR/postgres-backup-\$TIMESTAMP.sql.gz"
+# Backup ausführen (Datenbank nuclosdb, Benutzer nuclos = Vorgabe der Images)
+echo "Sichere Datenbank..."
+docker exec "$CONTAINER_NAME" pg_dump -U nuclos -Fc nuclosdb > "$BACKUP_DIR/nuclosdb-backup-$TIMESTAMP.backup"
+
+# Wiederherstellen mit:
+#   docker exec -i <container> pg_restore -U nuclos -d nuclosdb --clean --if-exists < <datei>.backup
 
 # Alte Backups nach 30 Tagen löschen
 echo "Lösche alte Datenbankbackups älter >30 Tage..."
-find "\$BACKUP_DIR" -type f -name "*.sql.gz" -mtime +30 -delete
+find "$BACKUP_DIR" -type f -name "*.backup" -mtime +30 -delete
 EOF
 
-# ###################################################################################################
-# ###################################################################################################
-# nuclos backup-instanz.sh ########################################################################
-cat > backup-instanz.sh <<EOF
+# ################################################################################
+# nuclos backup-instanz.sh #######################################################
+cat > backup-instanz.sh <<'EOF'
 #!/bin/bash
 set -e
-# Konfiguration
-# itsm-nuc-postgres
-CONTAINER_NAME=${PREFIX}-postgres
-DB_USER=${POSTGRES_USER}
-BACKUP_DIR="./nuclos-instanzbackup"
-TIMESTAMP=\$(date +"%Y-%m-%d_%H-%M-%S")
+# Instanzbackup / Vollbackup (Datenbank-Dump + alle Daten- und Konfigdateien)
+# Am besten als root ausführen (Verzeichnisse gehören den Container-Benutzern).
+cd "$(dirname "$0")"
+set -a; source ./.env; set +a
 
-echo "⚠️  Instanzbackup / Vollbackup"
+CONTAINER_NAME=${PREFIX}-db
+BACKUP_DIR="./nuclos-instanzbackup"
+TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+
+echo "⚠️  Instanzbackup / Vollbackup (Container werden kurz gestoppt)"
 read -p "Bist du sicher? (ja/nein): " confirm
-if [[ "\${confirm}" != "ja" ]]; then
+if [[ "${confirm}" != "ja" ]]; then
   echo "Abbruch durch Benutzer."
   exit 1
 fi
 
-
-
 # Backup-Verzeichnis sicherstellen
-mkdir -p "\$BACKUP_DIR"
+mkdir -p "$BACKUP_DIR"
 
-# Backup ausführen
+# Datenbank-Dump ausführen
 echo "Backup Database only..."
-docker exec "\$CONTAINER_NAME" pg_dumpall -U "\$DB_USER" | gzip > "\$BACKUP_DIR/postgres-backup-\$TIMESTAMP.sql.gz"
+docker exec "$CONTAINER_NAME" pg_dump -U nuclos -Fc nuclosdb > "$BACKUP_DIR/nuclosdb-backup-$TIMESTAMP.backup"
 
-echo "Lösche alte Backup >30 Tage..."
-# Alte Backups nach 30 Tagen löschen
-find "\$BACKUP_DIR" -type f -name "*.gz" -mtime +30 -delete
-
-
-
-# Container-Präfix aus .env laden
-if [[ -f .env ]]; then
-  export $(grep -v '^#' .env | xargs)
-else
-  echo "❌ .env-Datei nicht gefunden. Abbruch."
-  exit 1
-fi
+echo "Lösche alte Backups >30 Tage..."
+find "$BACKUP_DIR" -type f \( -name "*.backup" -o -name "*.tar.gz" \) -mtime +30 -delete
 
 echo "🧨 Stoppe Container..."
 docker compose down
 
-
 echo "🧨 Packe Datenverzeichnis..."
-tar -czvf \$BACKUP_DIR/backup-nuclos-data\$TIMESTAMP.tar.gz ./nuclos-data
+tar -czf "$BACKUP_DIR/backup-nuclos-data$TIMESTAMP.tar.gz" ./nuclos-data ./nuclos-extensions ./nuclos-backups
 echo "🧨 Packe Datenbankverzeichnis..."
-tar -czvf \$BACKUP_DIR/backup-nuclos-pgdata\$TIMESTAMP.tar.gz ./nuclos-pgdata
-
-echo "🧨 Packe .env"
-tar -czvf \$BACKUP_DIR/backup-nuclos-environment\$TIMESTAMP.tar.gz ".env"
-echo "🧨 Packe nuclos-config"
-tar -czvf \$BACKUP_DIR/backup-nuclos-config\$TIMESTAMP.tar.gz "nuclos-install-config.xml"
-
+tar -czf "$BACKUP_DIR/backup-nuclos-pgdata$TIMESTAMP.tar.gz" ./nuclos-pgdata
+echo "🧨 Packe Konfiguration (.env, docker-compose.yml, secrets)..."
+tar -czf "$BACKUP_DIR/backup-nuclos-config$TIMESTAMP.tar.gz" .env docker-compose.yml secrets
 
 echo "✅ Nuclos-Docker-Instanz wurde vollständig gesichert."
 
 echo "🧨 Starte Container neu..."
 docker compose up -d
-
 EOF
-# ###################################################################################################
-# Upgradscript ######################################################################################
-# ###################################################################################################
-cat > upgrade.sh <<EOF
+
+# ################################################################################
+# Upgradescript ##################################################################
+# ################################################################################
+cat > upgrade.sh <<'EOF'
 #!/bin/bash
 set -e
-# Konfiguration
-# itsm-nuc-postgres
-CONTAINER_NAME=${PREFIX}-postgres
-DB_USER=${POSTGRES_USER}
+# Nuclos Upgrade: Backup, neuen Image-Tag setzen, Images ziehen, neu starten.
+# Es wird KEIN Installer-JAR mehr benötigt - das Upgrade erfolgt über den
+# Image-Tag von https://hub.docker.com/r/nuccess/nuclos-server/tags
+cd "$(dirname "$0")"
+set -a; source ./.env; set +a
+
+CONTAINER_NAME=${PREFIX}-db
 BACKUP_DIR="./nuclos-instanzbackup"
-TIMESTAMP=\$(date +"%Y-%m-%d_%H-%M-%S")
+TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
 
 echo "⚠️  Nuclos Upgrade ausführen"
+echo "Aktueller Nuclos-Server Tag: ${NUCLOS_SERVER_TAG}"
+read -p "Neuer Tag [Enter für ${NUCLOS_SERVER_TAG}]: " NEW_TAG
+NEW_TAG=${NEW_TAG:-$NUCLOS_SERVER_TAG}
 read -p "Bist du sicher? (ja/nein): " confirm
-if [[ "\${confirm}" != "ja" ]]; then
+if [[ "${confirm}" != "ja" ]]; then
   echo "Abbruch durch Benutzer."
   exit 1
 fi
 
 # Backup-Verzeichnis sicherstellen
-mkdir -p "\$BACKUP_DIR"
+mkdir -p "$BACKUP_DIR"
 
-# Backup ausführen
+# Datenbank-Dump ausführen
 echo "Backup Database only..."
-docker exec "\$CONTAINER_NAME" pg_dumpall -U "\$DB_USER" | gzip > "\$BACKUP_DIR/postgres-backup-\$TIMESTAMP.sql.gz"
-
-echo "Lösche alte Backup >30 Tage..."
-# Alte Backups nach 30 Tagen löschen
-find "\$BACKUP_DIR" -type f -name "*.gz" -mtime +30 -delete
-
-
-# Container-Präfix aus .env laden
-if [[ -f .env ]]; then
-  export $(grep -v '^#' .env | xargs)
-else
-  echo "❌ .env-Datei nicht gefunden. Abbruch."
-  exit 1
-fi
+docker exec "$CONTAINER_NAME" pg_dump -U nuclos -Fc nuclosdb > "$BACKUP_DIR/nuclosdb-backup-$TIMESTAMP.backup"
 
 echo "🧨 Stoppe Container..."
 docker compose down
 
-
 echo "🧨 Packe Datenverzeichnis..."
-tar -czvf \$BACKUP_DIR/backup-nuclos-data\$TIMESTAMP.tar.gz ./nuclos-data
+tar -czf "$BACKUP_DIR/backup-nuclos-data$TIMESTAMP.tar.gz" ./nuclos-data ./nuclos-extensions ./nuclos-backups
 echo "🧨 Packe Datenbankverzeichnis..."
-tar -czvf \$BACKUP_DIR/backup-nuclos-pgdata\$TIMESTAMP.tar.gz ./nuclos-pgdata
+tar -czf "$BACKUP_DIR/backup-nuclos-pgdata$TIMESTAMP.tar.gz" ./nuclos-pgdata
+echo "🧨 Packe Konfiguration (.env, docker-compose.yml, secrets)..."
+tar -czf "$BACKUP_DIR/backup-nuclos-config$TIMESTAMP.tar.gz" .env docker-compose.yml secrets
 
-echo "🧨 Packe .env"
-tar -czvf \$BACKUP_DIR/backup-nuclos-environment\$TIMESTAMP.tar.gz ".env"
-echo "🧨 Packe nuclos-config"
-tar -czvf \$BACKUP_DIR/backup-nuclos-config\$TIMESTAMP.tar.gz "nuclos-install-config.xml"
+echo "✅ Backup abgeschlossen."
 
+echo "Setze neuen Nuclos-Server Tag: ${NEW_TAG} ..."
+sed -i "s|^NUCLOS_SERVER_TAG=.*|NUCLOS_SERVER_TAG=\"${NEW_TAG}\"|" .env
 
-echo "✅ Nuclos-Docker-Instanz wurde vollständig gesichert."
+echo "Ziehe Images..."
+docker compose pull
 
-
-echo "Baue neues Docker Image mit Tag: snnuclos:${IMAGE_TAG} ..."
-
-if ! docker build -t snnuclos:${IMAGE_TAG} .; then
-    echo "❌ Docker build failed"
-    exit 1
-fi
-
-echo "🧨 Starte Container neu..."
+echo "🧨 Starte Container neu (Datenbank-Migration läuft automatisch)..."
 docker compose up -d
 
+echo "Fortschritt beobachten mit: docker compose logs -f server"
 EOF
 
-# ###################################################################################################
-# ###################################################################################################
-# ###################################################################################################
-
-
-# Restore ##########################################################################################
-# nuclos restore-instanz-script ####################################################################
-
-cat > restore-instanz.sh <<EOF
+# ################################################################################
+# Restore ########################################################################
+# nuclos restore-instanz-script ##################################################
+cat > restore-instanz.sh <<'EOF'
 #!/bin/bash
 set -e
-# Konfiguration
-# itsm-nuc-postgres
+# Instanz aus dem letzten Vollbackup (backup-instanz.sh) wiederherstellen.
+# Am besten als root ausführen.
+cd "$(dirname "$0")"
+
 BACKUP_DIR="./nuclos-instanzbackup"
 ARCHIVE_DIR="./nuclos-archiv"
-TIMESTAMP=\$(date +"%Y-%m-%d_%H-%M-%S")
 
 echo "⚠️  Instanz zurückspielen / Möglicher Datenverlust ⚠️"
 echo "Dadurch wird die aktuelle Instanz überschrieben"
 read -p "Bist du sicher? (ja/nein): " confirm
-if [[ "\${confirm}" != "ja" ]]; then
+if [[ "${confirm}" != "ja" ]]; then
   echo "Abbruch durch Benutzer."
   exit 1
 fi
 
 # Archiv-Verzeichnis sicherstellen
-mkdir -p "\$ARCHIVE_DIR"
+mkdir -p "$ARCHIVE_DIR"
 
-echo "🧨 Verschiebe Backup-Dateien aus $BACKUP_DIR..."
-mv "\$BACKUP_DIR"/* ./
+# Jeweils das NEUESTE Backup-Set ermitteln
+newest() { ls -1t "$BACKUP_DIR"/$1 2>/dev/null | head -n1; }
+TAR_PGDATA=$(newest 'backup-nuclos-pgdata*.tar.gz')
+TAR_DATA=$(newest 'backup-nuclos-data*.tar.gz')
+TAR_CONFIG=$(newest 'backup-nuclos-config*.tar.gz')
 
+if [[ -z "$TAR_PGDATA" || -z "$TAR_DATA" || -z "$TAR_CONFIG" ]]; then
+  echo "❌ Kein vollständiges Backup-Set in $BACKUP_DIR gefunden. Abbruch."
+  exit 1
+fi
+echo "Wiederherzustellendes Set:"
+echo "  $TAR_PGDATA"
+echo "  $TAR_DATA"
+echo "  $TAR_CONFIG"
 
 echo "🧨 Stoppe Container..."
 docker compose down
 
 echo "🧨 Entpacke Datenverzeichnisse..."
-tar -xzvf backup-nuclos-pgdata*.tar.gz
-tar -xzvf backup-nuclos-data*.tar.gz
-echo "🧨 Entpacke .env"
-tar -xzvf backup-nuclos-environment*.tar.gz
-echo "🧨 Entpacke nuclos-config"
-tar -xzvf backup-nuclos-config*.tar.gz
-
+tar -xzf "$TAR_PGDATA"
+tar -xzf "$TAR_DATA"
+echo "🧨 Entpacke Konfiguration..."
+tar -xzf "$TAR_CONFIG"
 
 echo "🧨 Starte Container..."
 docker compose up -d
 
-
-echo "Aufräumen..."
-mv  *.gz "\$ARCHIVE_DIR"/
-
+echo "Aufräumen (verwendetes Set ins Archiv verschieben)..."
+mv "$TAR_PGDATA" "$TAR_DATA" "$TAR_CONFIG" "$ARCHIVE_DIR"/
 EOF
 
-
-
-# ###################################################################################################
-# ###################################################################################################
-# ###################################################################################################
-# ###################################################################################################
-# Ausführbar machen #################################################################################
-
+# ################################################################################
+# Ausführbar machen ##############################################################
 chmod +x backup-db.sh
 chmod +x backup-instanz.sh
 chmod +x uninstall.sh
 chmod +x restore-instanz.sh
 chmod +x upgrade.sh
 
+echo ""
 echo "Alle Konfigurationsdateien wurden erfolgreich erzeugt:"
 echo "- .env"
-echo "- Dockerfile"
 echo "- docker-compose.yml"
-echo "- nuclos-install-config.xml"
+echo "- secrets/db_password (+ .gitignore-Schutz)"
 echo "- uninstall.sh"
 echo "- backup-db.sh"
 echo "- backup-instanz.sh"
 echo "- restore-instanz.sh"
+echo "- upgrade.sh"
 
+# Container starten ##############################################################
+if [[ $NO_START -eq 1 ]]; then
+  echo ""
+  echo "ℹ️  --no-start gesetzt: Container werden nicht gestartet."
+  echo "   Start später mit: docker compose up -d"
+else
+  echo ""
+  echo "Ziehe Docker-Images (nuccess/nuclos-db:${NUCLOS_DB_TAG}, nuccess/nuclos-server:${NUCLOS_SERVER_TAG})..."
+  if ! docker compose pull; then
+      echo "❌ Docker pull fehlgeschlagen"
+      exit 1
+  fi
 
+  echo "Starte Docker-Container..."
+  docker compose up -d
 
-echo "Baue Docker Image mit Tag: snnuclos:${IMAGE_TAG} ..."
-
-
-# docker build -t snnuclos:${IMAGE_TAG} .
-# Modify Docker build section
-if ! docker build -t snnuclos:${IMAGE_TAG} .; then
-    echo "❌ Docker build failed"
-    exit 1
+  echo ""
+  echo "⏳ Hinweis: Der ERSTE Start dauert mehrere Minuten (automatisches"
+  echo "   Datenbank-Setup). Fortschritt: docker compose logs -f server"
 fi
 
-echo "Starte Docker-Container..."
-docker compose up -d 
-
+# Zusammenfassung ################################################################
+echo ""
 echo "------------------------------------------------------------"
 echo "✅ Installation abgeschlossen."
-echo
+echo ""
+echo "Nuclos Webclient:   http://<server-ip>:${NUCLOS_PORT}"
+echo "Nuclos Startseite:  http://<server-ip>:${NUCLOS_PORT}/nuclos"
+echo "Desktop-Client:     nuclos://<server-ip>:${NUCLOS_PORT}/nuclos"
+echo "Standard-Benutzer:  nuclos (leeres Passwort) -> nach dem ersten"
+echo "                    Login unbedingt Passwort setzen!"
+if [[ "$MSSQL_PREP" =~ ^[JjYy] ]]; then
+DISPLAY_MSSQL_HOST=${SAGE_MSSQL_HOST:-"<sage-server>"}
+echo ""
+echo "--- Sage 100 / MS-SQL Anbindung ----------------------------"
+echo "In Nuclos eine externe Datenbankverbindung anlegen"
+echo "(Administration -> Datenbankverbindungen), z.B. für Datenquellen"
+echo "und dynamische Entitäten auf die Sage-100-Daten:"
+echo ""
+echo "  Treiber-Klasse: com.microsoft.sqlserver.jdbc.SQLServerDriver"
+echo "  JDBC-URL:       jdbc:sqlserver://${DISPLAY_MSSQL_HOST}:${SAGE_MSSQL_PORT};databaseName=${SAGE_MSSQL_DB};encrypt=true;trustServerCertificate=true"
+echo "  Benutzer:       <SQL-Login mit Lesezugriff auf die Sage-DB>"
+echo ""
+echo "Voraussetzungen auf dem Sage/MS-SQL-Server:"
+echo "  - TCP/IP im SQL Server Configuration Manager aktiviert (Port ${SAGE_MSSQL_PORT})"
+echo "  - SQL-Server-Authentifizierung (Mixed Mode) + eigener Login,"
+echo "    empfohlen nur mit Lesezugriff (db_datareader) auf die Sage-DB"
+echo "  - Firewall: der Docker-Host muss ${DISPLAY_MSSQL_HOST}:${SAGE_MSSQL_PORT} erreichen"
+if [[ "$SAGE_MSSQL_HOST" == "host.docker.internal" ]]; then
+echo "  - 'host.docker.internal' zeigt auf den Docker-Host (MS-SQL läuft dort)"
+fi
+echo ""
+echo "Der JDBC-Treiber liegt in ./nuclos-extensions/server/ und wird beim"
+echo "Serverstart automatisch geladen."
+fi
+echo ""
 echo "------------------------------------------------------------"
 echo "               ⚠️ ⚠️ ⚠️ ⚠️ ⚠️ ⚠️ ⚠️ ⚠️ ⚠️ ⚠️               "
 echo "Produktivbetrieb im Internet nur hinter einem Reverse-Proxy!"
+echo "(siehe Beipiel-NGINX-Config.txt)"
 echo "------------------------------------------------------------"
-
-
-
