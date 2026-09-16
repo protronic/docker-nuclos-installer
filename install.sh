@@ -76,7 +76,9 @@ default_ram_db=2
 default_tz=Europe/Berlin
 default_locale=de_DE.UTF-8
 default_mssql_port=1433
-default_mssql_db=SageDB
+default_mssql_db=OLReweAbf       # Standard-Datenbankname von Sage 100
+default_mssql_user=nuclos_ro     # Read-only-Login fuer Nuclos (wird mit sage100/01-*.sql angelegt)
+MSSQL_TOOLS_IMAGE=mcr.microsoft.com/mssql-tools:latest  # sqlcmd fuer den Verbindungstest
 MSSQL_JDBC_VERSION=13.6.0.jre11  # Microsoft JDBC-Treiber (Java 11+, passend zu Java 17 im Image)
 
 # Feste Vorgaben der nuccess-Images (nicht änderbar):
@@ -141,6 +143,58 @@ download() {
   else
     echo "❌ Weder curl noch wget vorhanden"
     return 1
+  fi
+}
+
+mssql_query() {
+  # mssql_query "<SQL>" -> Ergebniszeilen (Tab-getrennt, ohne Header) auf stdout.
+  # Läuft in einem Wegwerf-Container; das Passwort geht nur per Umgebungsvariable
+  # an sqlcmd und taucht nicht in der Prozessliste auf.
+  docker run --rm --add-host host.docker.internal:host-gateway \
+    -e "SQLCMDPASSWORD=${SAGE_TEST_PASS}" "$MSSQL_TOOLS_IMAGE" \
+    /opt/mssql-tools/bin/sqlcmd -S "${SAGE_MSSQL_HOST},${SAGE_MSSQL_PORT}" \
+    -U "$SAGE_TEST_USER" -l 10 -b -h -1 -W -s $'\t' -Q "SET NOCOUNT ON; $1" 2>&1
+}
+
+sage_connection_test() {
+  # Echter Verbindungstest gegen den Sage-100-SQL-Server: Login, Datenbanken,
+  # Sage-Struktur (KHKMandanten) und Mandantenliste.
+  local dbs out first mandanten newdb
+  echo "Lade sqlcmd-Container (${MSSQL_TOOLS_IMAGE}, beim ersten Mal etwas Geduld)..."
+  if ! docker pull -q "$MSSQL_TOOLS_IMAGE" >/dev/null 2>&1; then
+    echo "⚠️  Image konnte nicht geladen werden - Verbindungstest übersprungen."
+    return 0
+  fi
+  echo "Prüfe SQL-Login ${SAGE_TEST_USER} auf ${SAGE_MSSQL_HOST}:${SAGE_MSSQL_PORT} ..."
+  if ! dbs=$(mssql_query "SELECT name FROM sys.databases WHERE database_id > 4 ORDER BY name"); then
+    echo "❌ Anmeldung fehlgeschlagen:"
+    echo "$dbs" | head -n 3 | sed 's/^/   /'
+    echo "   (Login/Passwort, SQL-Authentifizierung (Mixed Mode) und Firewall prüfen)"
+    return 0
+  fi
+  echo "✅ Anmeldung erfolgreich. Sichtbare Datenbanken auf dem Server:"
+  echo "$dbs" | sed 's/^/   - /'
+  if ! echo "$dbs" | grep -qix "$SAGE_MSSQL_DB"; then
+    echo "⚠️  Datenbank '${SAGE_MSSQL_DB}' nicht gefunden (oder keine Berechtigung)."
+    read -p "Datenbankname korrigieren [Enter für ${SAGE_MSSQL_DB}]: " newdb
+    SAGE_MSSQL_DB=${newdb:-$SAGE_MSSQL_DB}
+  fi
+  if ! out=$(mssql_query "SELECT CASE WHEN OBJECT_ID('[${SAGE_MSSQL_DB}].dbo.KHKMandanten') IS NULL THEN 'NO' ELSE 'YES' END") \
+     || [[ "$(echo "$out" | grep -v '^[[:space:]]*$' | tail -n1 | tr -d '[:space:]')" != "YES" ]]; then
+    echo "⚠️  In '${SAGE_MSSQL_DB}' wurde keine Sage-100-Struktur gefunden (Tabelle KHKMandanten fehlt)."
+    echo "   Datenbankname prüfen - die Angaben können später in Nuclos korrigiert werden."
+    return 0
+  fi
+  echo "✅ '${SAGE_MSSQL_DB}' ist eine Sage-100-Datenbank."
+  if mandanten=$(mssql_query "SELECT m.Mandant, (SELECT COUNT(*) FROM [${SAGE_MSSQL_DB}].dbo.KHKAdressen a WHERE a.Mandant = m.Mandant) FROM (SELECT DISTINCT Mandant FROM [${SAGE_MSSQL_DB}].dbo.KHKMandanten) m ORDER BY m.Mandant") \
+     && [[ -n "$mandanten" ]]; then
+    echo "Mandanten in ${SAGE_MSSQL_DB}:"
+    echo "$mandanten" | awk -F'\t' '{printf "   - Mandant %s  (%s Adressen)\n", $1, $2}'
+    first=$(echo "$mandanten" | head -n1 | cut -f1)
+    read -p "Mandant für die Nuclos-Anbindung [Enter für ${first}]: " SAGE_MSSQL_MANDANT
+    SAGE_MSSQL_MANDANT=${SAGE_MSSQL_MANDANT:-$first}
+  else
+    echo "⚠️  Mandanten konnten nicht gelesen werden (Berechtigung auf ${SAGE_MSSQL_DB}?)."
   fi
 }
 
@@ -238,6 +292,10 @@ MSSQL_PREP=${MSSQL_PREP:-J}
 SAGE_MSSQL_HOST=""
 SAGE_MSSQL_PORT=""
 SAGE_MSSQL_DB=""
+SAGE_MSSQL_USER=""
+SAGE_MSSQL_MANDANT=""
+SAGE_TEST_USER=""
+SAGE_TEST_PASS=""
 if [[ "$MSSQL_PREP" =~ ^[JjYy] ]]; then
   echo "Der MS-SQL-Server (Sage 100) läuft auf einem ANDEREN Server:"
   echo "Hostname oder IP dieses Servers angeben - er muss vom Docker-Host aus"
@@ -249,19 +307,44 @@ if [[ "$MSSQL_PREP" =~ ^[JjYy] ]]; then
   SAGE_MSSQL_PORT=${SAGE_MSSQL_PORT:-$default_mssql_port}
   read -p "Sage 100 Datenbankname [Enter für $default_mssql_db]: " SAGE_MSSQL_DB
   SAGE_MSSQL_DB=${SAGE_MSSQL_DB:-$default_mssql_db}
+  echo "SQL-Benutzer, mit dem Nuclos auf die Sage-Datenbank zugreift (empfohlen ein"
+  echo "eigener Read-only-Login; wird mit sage100/01-nuclos-readonly-login.sql angelegt)."
+  read -p "SQL-Benutzer für Nuclos [Enter für $default_mssql_user]: " SAGE_MSSQL_USER
+  SAGE_MSSQL_USER=${SAGE_MSSQL_USER:-$default_mssql_user}
 
   if [[ -z "$SAGE_MSSQL_HOST" ]]; then
     echo "ℹ️  Kein Host angegeben - die Verbindungsdaten können später direkt"
     echo "   in Nuclos hinterlegt werden."
-  elif [[ "$SAGE_MSSQL_HOST" != "host.docker.internal" ]]; then
-    echo "Prüfe Erreichbarkeit von ${SAGE_MSSQL_HOST}:${SAGE_MSSQL_PORT} ..."
-    if timeout 5 bash -c "exec 3<>/dev/tcp/${SAGE_MSSQL_HOST}/${SAGE_MSSQL_PORT} && exec 3>&-" 2>/dev/null; then
-      echo "✅ ${SAGE_MSSQL_HOST}:${SAGE_MSSQL_PORT} ist vom Docker-Host aus erreichbar."
-    else
-      echo "⚠️  ${SAGE_MSSQL_HOST}:${SAGE_MSSQL_PORT} ist aktuell NICHT erreichbar."
-      echo "   Bitte prüfen: Firewall-Freigabe vom Docker-Host, TCP/IP im"
-      echo "   SQL Server Configuration Manager, Namensauflösung."
-      echo "   (Die Installation läuft trotzdem weiter.)"
+  else
+    if [[ "$SAGE_MSSQL_HOST" != "host.docker.internal" ]]; then
+      echo "Prüfe Erreichbarkeit von ${SAGE_MSSQL_HOST}:${SAGE_MSSQL_PORT} ..."
+      if timeout 5 bash -c "exec 3<>/dev/tcp/${SAGE_MSSQL_HOST}/${SAGE_MSSQL_PORT} && exec 3>&-" 2>/dev/null; then
+        echo "✅ ${SAGE_MSSQL_HOST}:${SAGE_MSSQL_PORT} ist vom Docker-Host aus erreichbar."
+      else
+        echo "⚠️  ${SAGE_MSSQL_HOST}:${SAGE_MSSQL_PORT} ist aktuell NICHT erreichbar."
+        echo "   Bitte prüfen: Firewall-Freigabe vom Docker-Host, TCP/IP im"
+        echo "   SQL Server Configuration Manager, Namensauflösung."
+        echo "   (Die Installation läuft trotzdem weiter.)"
+      fi
+    fi
+
+    echo ""
+    echo "Optional: Verbindungstest mit echter SQL-Anmeldung. Der Installer prüft"
+    echo "den Login, listet die Datenbanken des Sage-Servers auf und zeigt die"
+    echo "Mandanten zur Auswahl. Das läuft in einem Wegwerf-Container mit sqlcmd -"
+    echo "nichts wird auf dem Host installiert, das Passwort wird nicht gespeichert."
+    echo "(Existiert ${SAGE_MSSQL_USER} noch nicht, kann z.B. 'sa' zum Testen genutzt werden.)"
+    read -p "Login für den Verbindungstest [Enter für ${SAGE_MSSQL_USER}]: " SAGE_TEST_USER
+    SAGE_TEST_USER=${SAGE_TEST_USER:-$SAGE_MSSQL_USER}
+    read -s -p "Passwort für ${SAGE_TEST_USER} [Enter = Test überspringen]: " SAGE_TEST_PASS
+    echo ""
+    if [[ -n "$SAGE_TEST_PASS" ]]; then
+      if docker info >/dev/null 2>&1; then
+        sage_connection_test
+      else
+        echo "⚠️  Docker-Daemon nicht erreichbar - Verbindungstest übersprungen."
+      fi
+      unset SAGE_TEST_PASS
     fi
   fi
 fi
@@ -351,6 +434,8 @@ LOCALE="${LOCALE_VALUE}"
 SAGE_MSSQL_HOST="${SAGE_MSSQL_HOST}"
 SAGE_MSSQL_PORT="${SAGE_MSSQL_PORT}"
 SAGE_MSSQL_DB="${SAGE_MSSQL_DB}"
+SAGE_MSSQL_USER="${SAGE_MSSQL_USER}"
+SAGE_MSSQL_MANDANT="${SAGE_MSSQL_MANDANT}"
 EOF
 
 # docker-compose.yml erzeugen ####################################################
@@ -742,7 +827,15 @@ echo "und dynamische Entitäten auf die Sage-100-Daten:"
 echo ""
 echo "  Treiber-Klasse: com.microsoft.sqlserver.jdbc.SQLServerDriver"
 echo "  JDBC-URL:       jdbc:sqlserver://${DISPLAY_MSSQL_HOST}:${SAGE_MSSQL_PORT};databaseName=${SAGE_MSSQL_DB};encrypt=true;trustServerCertificate=true"
-echo "  Benutzer:       <SQL-Login mit Lesezugriff auf die Sage-DB>"
+echo "  Benutzer:       ${SAGE_MSSQL_USER:-nuclos_ro}  (Passwort wird beim Anlegen der Verbindung in Nuclos eingegeben)"
+if [[ -n "$SAGE_MSSQL_MANDANT" ]]; then
+echo "  Mandant:        ${SAGE_MSSQL_MANDANT}  (in Datenquellen: WHERE Mandant = ${SAGE_MSSQL_MANDANT})"
+fi
+echo ""
+echo "Empfehlung: Sage-seitig einen Read-only-Login und das Schema 'nuclos' mit"
+echo "Views auf Adressen, Kunden, Artikel und Belege anlegen - fertige SQL-Skripte"
+echo "und Datenquellen-Beispiele im Ordner sage100/ des Repos:"
+echo "  https://github.com/protronic/docker-nuclos-installer/tree/main/sage100"
 echo ""
 echo "Voraussetzungen auf dem Sage/MS-SQL-Server:"
 echo "  - TCP/IP im SQL Server Configuration Manager aktiviert (Port ${SAGE_MSSQL_PORT})"

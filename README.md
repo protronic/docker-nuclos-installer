@@ -43,7 +43,9 @@ Wichtig zu wissen:
   - Treiber-Klasse: `com.microsoft.sqlserver.jdbc.SQLServerDriver`
   - JDBC-URL: `jdbc:sqlserver://<sage-server>:1433;databaseName=<SageDB>;encrypt=true;trustServerCertificate=true`
 - **Netzwerk:** Der Docker-Host muss den Sage-100-Server auf Port 1433 erreichen (Firewall-Freigabe, Namensauflösung). `install.sh` prüft die Erreichbarkeit direkt bei der Installation. Sonderfall: läuft MS-SQL doch auf dem Docker-Host selbst, als Host `host.docker.internal` verwenden (in der erzeugten `docker-compose.yml` bereits eingerichtet).
-- Voraussetzungen auf dem MS-SQL-Server: TCP/IP aktiviert (SQL Server Configuration Manager), Port 1433 in der Firewall freigegeben, SQL-Server-Authentifizierung (Mixed Mode) mit eigenem Login – empfohlen **nur Lesezugriff** (`db_datareader`) auf die Sage-Datenbank.
+- Voraussetzungen auf dem MS-SQL-Server: TCP/IP aktiviert (SQL Server Configuration Manager), Port 1433 in der Firewall freigegeben, SQL-Server-Authentifizierung (Mixed Mode) mit eigenem Login – **nur lesend**.
+- **Sage-seitige Vorbereitung (empfohlen):** Die SQL-Skripte im Ordner [`sage100/`](sage100/README.md) legen den Read-only-Login `nuclos_ro` und ein Schema `nuclos` mit Views auf Adressen, Kunden/Lieferanten, Artikel und Belege an (Spaltenlisten werden dynamisch aus `INFORMATION_SCHEMA` erzeugt, passend zur jeweiligen Sage-Version). Nuclos liest ausschließlich über diese Views. Dazu Beispiel-Abfragen für Nuclos-Datenquellen.
+- **Verbindungstest im Installer:** `install.sh` fragt Sage-Server, Port, Datenbank (Standard `OLReweAbf`) und den SQL-Benutzer für Nuclos (Standard `nuclos_ro`) ab. Optional prüft es mit einem SQL-Login die Anmeldung wirklich (Wegwerf-Container `mcr.microsoft.com/mssql-tools`, nichts wird installiert, Passwort wird nicht gespeichert), listet die Datenbanken auf, erkennt die Sage-100-Struktur und zeigt die **Mandanten** zur Auswahl. Ergebnis landet in `.env` (`SAGE_MSSQL_*`) und in der Zusammenfassung am Ende.
 - **Keine Portkonflikte:** Nuclos belegt einen freien HTTP-Port ab 8080, der PostgreSQL-Container wird nicht am Host veröffentlicht, der Sage-Server bleibt unberührt.
 
 ## Installation
@@ -76,6 +78,7 @@ Danach erreichbar unter:
 | `docker-compose.yml` | Compose-Stack (db + server) |
 | `secrets/db_password` | Datenbank-Passwort (Secret-Datei, nicht in `.env`!) |
 | `.gitignore` | Wird miterzeugt: Secrets, `.env` und alle Laufzeitdaten sind vom Einchecken ausgeschlossen |
+| `sage100/` (im Repo) | SQL-Skripte für den Sage-Server: Read-only-Login, Schema `nuclos` mit Views, Datenquellen-Beispiele |
 | `nuclos-pgdata/` | PostgreSQL-Daten |
 | `nuclos-data/` | Dokumente, Suchindex, Logs, Nuclet-Autoimport |
 | `nuclos-extensions/server/` | Server-Extensions, u.a. der MS-SQL JDBC-Treiber |

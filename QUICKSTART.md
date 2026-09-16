@@ -33,9 +33,12 @@ Das Script fragt alles interaktiv ab – **Enter übernimmt jeweils den Vorschla
 | Sage 100 / MS-SQL vorbereiten? | `J` |
 | MS-SQL Host | Hostname/IP des **Sage-100-Servers** |
 | MS-SQL Port | Enter (1433) |
-| Sage-Datenbankname | Name der Sage-100-Datenbank |
+| Sage-Datenbankname | Enter (`OLReweAbf`, Sage-Standard) |
+| SQL-Benutzer für Nuclos | Enter (`nuclos_ro`, wird mit `sage100/01-*.sql` angelegt) |
+| Login / Passwort für Verbindungstest | z.B. `sa` + Passwort – oder Passwort leer lassen = Test überspringen |
+| Mandant | Enter (erster gefundener) oder Mandantennummer |
 
-Der Installer prüft direkt, ob der Sage-Server auf dem MS-SQL-Port erreichbar ist, lädt den MS-SQL-JDBC-Treiber und startet die Container.
+Der Installer prüft, ob der Sage-Server erreichbar ist, testet auf Wunsch die SQL-Anmeldung (listet Datenbanken und Mandanten auf), lädt den MS-SQL-JDBC-Treiber und startet die Container.
 
 ## 3. Ersten Start abwarten
 
@@ -57,19 +60,19 @@ Fertig, sobald der Tomcat-Start durchgelaufen ist bzw. `docker compose ps` den S
 
 Vorbereitung auf dem Sage-/MS-SQL-Server (einmalig, macht der Sage-/DB-Admin):
 
-1. TCP/IP im *SQL Server Configuration Manager* aktivieren, Port 1433
-2. SQL-Server-Authentifizierung (Mixed Mode) und eigenen SQL-Login anlegen, empfohlen **nur lesend** (`db_datareader`) auf die Sage-Datenbank
-3. Firewall: Port 1433 für den Docker-Host freigeben
+1. TCP/IP im *SQL Server Configuration Manager* aktivieren, Port 1433; SQL-Server-Authentifizierung (Mixed Mode) einschalten
+2. Firewall: Port 1433 für den Docker-Host freigeben
+3. Die SQL-Skripte aus [`sage100/`](sage100/README.md) in SSMS ausführen: `01` legt den Read-only-Login `nuclos_ro` an (Passwort im Skript anpassen!), `02` erzeugt das Schema `nuclos` mit Views auf Adressen, Kunden, Lieferanten, Artikel und Belege
 
 Dann in Nuclos (Desktop-Client) unter **Administration → Datenbankverbindungen** eine neue Verbindung anlegen – die Werte gibt der Installer am Ende fertig aus:
 
 ```
 Treiber-Klasse: com.microsoft.sqlserver.jdbc.SQLServerDriver
-JDBC-URL:       jdbc:sqlserver://<sage-server>:1433;databaseName=<SageDB>;encrypt=true;trustServerCertificate=true
-Benutzer:       <SQL-Login mit Lesezugriff>
+JDBC-URL:       jdbc:sqlserver://<sage-server>:1433;databaseName=OLReweAbf;encrypt=true;trustServerCertificate=true
+Benutzer:       nuclos_ro  (Passwort aus Skript 01)
 ```
 
-Der Treiber liegt schon in `nuclos-extensions/server/` und wird beim Serverstart automatisch geladen. Danach stehen die Sage-Daten z.B. für Datenquellen und dynamische Entitäten zur Verfügung.
+Der Treiber liegt schon in `nuclos-extensions/server/` und wird beim Serverstart automatisch geladen. Danach unter **Administration → Datenquellen** die Beispiel-Abfragen aus `sage100/03-nuclos-datenquellen-beispiele.sql` anlegen (Mandant einsetzen) und darauf dynamische Entitäten aufbauen – die Sage-Daten stehen dann in Nuclos lesend zur Verfügung.
 
 ## 6. Die wichtigsten Befehle
 
