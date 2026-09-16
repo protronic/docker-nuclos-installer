@@ -10,6 +10,11 @@
    INFORMATION_SCHEMA erzeugt. Dadurch passen sie zu jeder Sage-100-
    Version (kein SELECT *, keine fest verdrahteten Spaltennamen).
    Tabellen, die es in Ihrer Sage-Version nicht gibt, werden übersprungen.
+
+   View- und Spaltennamen sind KLEINGESCHRIEBEN (kto, matchcode, ...):
+   MS-SQL ist ohnehin case-insensitiv, und in der Nuclos-DB (PostgreSQL,
+   Einbindung per tds_fdw als Schema "sage") lassen sich die Fremdtabellen
+   dann ohne Anführungszeichen abfragen: SELECT kto FROM sage.kunden
    ===================================================================== */
 
 USE [OLReweAbf];
@@ -42,7 +47,7 @@ BEGIN
     END;
 
     DECLARE @cols nvarchar(max) = STUFF((
-        SELECT ', ' + QUOTENAME(COLUMN_NAME)
+        SELECT ', ' + QUOTENAME(COLUMN_NAME) + ' AS ' + QUOTENAME(LOWER(COLUMN_NAME))
         FROM INFORMATION_SCHEMA.COLUMNS
         WHERE TABLE_SCHEMA = N'dbo' AND TABLE_NAME = @Table
         ORDER BY ORDINAL_POSITION
@@ -63,17 +68,17 @@ END
 GO
 
 /* ---- 1:1-Views: Stammdaten und Belege ------------------------------- */
-EXEC nuclos.usp_CreateTableView N'KHKMandanten',           N'Mandanten';
-EXEC nuclos.usp_CreateTableView N'KHKAdressen',            N'Adressen';
-EXEC nuclos.usp_CreateTableView N'KHKAnsprechpartner',     N'Ansprechpartner';
-EXEC nuclos.usp_CreateTableView N'KHKKontokorrent',        N'Kontokorrent';
-EXEC nuclos.usp_CreateTableView N'KHKArtikel',             N'Artikel';
-EXEC nuclos.usp_CreateTableView N'KHKArtikelvarianten',    N'Artikelvarianten';
-EXEC nuclos.usp_CreateTableView N'KHKVKBelege',            N'VKBelege';
-EXEC nuclos.usp_CreateTableView N'KHKVKBelegePositionen',  N'VKBelegePositionen';
-EXEC nuclos.usp_CreateTableView N'KHKEKBelege',            N'EKBelege';
-EXEC nuclos.usp_CreateTableView N'KHKEKBelegePositionen',  N'EKBelegePositionen';
-EXEC nuclos.usp_CreateTableView N'KHKLagerplatzBuchungen', N'Lagerbuchungen';
+EXEC nuclos.usp_CreateTableView N'KHKMandanten',           N'mandanten';
+EXEC nuclos.usp_CreateTableView N'KHKAdressen',            N'adressen';
+EXEC nuclos.usp_CreateTableView N'KHKAnsprechpartner',     N'ansprechpartner';
+EXEC nuclos.usp_CreateTableView N'KHKKontokorrent',        N'kontokorrent';
+EXEC nuclos.usp_CreateTableView N'KHKArtikel',             N'artikel';
+EXEC nuclos.usp_CreateTableView N'KHKArtikelvarianten',    N'artikelvarianten';
+EXEC nuclos.usp_CreateTableView N'KHKVKBelege',            N'vkbelege';
+EXEC nuclos.usp_CreateTableView N'KHKVKBelegePositionen',  N'vkbelegepositionen';
+EXEC nuclos.usp_CreateTableView N'KHKEKBelege',            N'ekbelege';
+EXEC nuclos.usp_CreateTableView N'KHKEKBelegePositionen',  N'ekbelegepositionen';
+EXEC nuclos.usp_CreateTableView N'KHKLagerplatzBuchungen', N'lagerbuchungen';
 GO
 
 /* ---- Kombinierte Views Kunden / Lieferanten -------------------------
@@ -82,7 +87,7 @@ GO
    Mandant + Adresse). Werte von KtoArt bei Bedarf prüfen mit:
      SELECT DISTINCT KtoArt FROM dbo.KHKKontokorrent
    Spaltennamen, die in beiden Tabellen vorkommen, erhalten aus der
-   Adresse den Präfix Adr_ (z.B. Adr_Matchcode).                        */
+   Adresse den Präfix adr_ (z.B. adr_matchcode).                        */
 IF OBJECT_ID(N'nuclos.usp_CreateKontoView', N'P') IS NOT NULL
     DROP PROCEDURE nuclos.usp_CreateKontoView;
 GO
@@ -107,21 +112,21 @@ BEGIN
 
     -- alle Spalten des Kontokorrents (Alias k) ...
     DECLARE @kcols nvarchar(max) = STUFF((
-        SELECT ', k.' + QUOTENAME(COLUMN_NAME)
+        SELECT ', k.' + QUOTENAME(COLUMN_NAME) + ' AS ' + QUOTENAME(LOWER(COLUMN_NAME))
         FROM INFORMATION_SCHEMA.COLUMNS
         WHERE TABLE_SCHEMA = N'dbo' AND TABLE_NAME = N'KHKKontokorrent'
         ORDER BY ORDINAL_POSITION
         FOR XML PATH(''), TYPE).value('.', 'nvarchar(max)'), 1, 2, '');
 
-    -- ... plus alle Adressspalten (Alias a); Namensdoubletten mit Präfix Adr_
+    -- ... plus alle Adressspalten (Alias a); Namensdoubletten mit Präfix adr_
     DECLARE @acols nvarchar(max) = STUFF((
-        SELECT ', a.' + QUOTENAME(c.COLUMN_NAME)
-             + CASE WHEN EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS k
-                                 WHERE k.TABLE_SCHEMA = N'dbo'
-                                   AND k.TABLE_NAME  = N'KHKKontokorrent'
-                                   AND k.COLUMN_NAME = c.COLUMN_NAME)
-                    THEN ' AS ' + QUOTENAME('Adr_' + c.COLUMN_NAME)
-                    ELSE '' END
+        SELECT ', a.' + QUOTENAME(c.COLUMN_NAME) + ' AS '
+             + QUOTENAME(LOWER(CASE WHEN EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS k
+                                                  WHERE k.TABLE_SCHEMA = N'dbo'
+                                                    AND k.TABLE_NAME  = N'KHKKontokorrent'
+                                                    AND k.COLUMN_NAME = c.COLUMN_NAME)
+                                     THEN 'adr_' + c.COLUMN_NAME
+                                     ELSE c.COLUMN_NAME END))
         FROM INFORMATION_SCHEMA.COLUMNS c
         WHERE c.TABLE_SCHEMA = N'dbo' AND c.TABLE_NAME = N'KHKAdressen'
         ORDER BY c.ORDINAL_POSITION
@@ -144,8 +149,8 @@ BEGIN
 END
 GO
 
-EXEC nuclos.usp_CreateKontoView N'Kunden',      N'D';
-EXEC nuclos.usp_CreateKontoView N'Lieferanten', N'K';
+EXEC nuclos.usp_CreateKontoView N'kunden',      N'D';
+EXEC nuclos.usp_CreateKontoView N'lieferanten', N'K';
 GO
 
 /* ---- Ergebnis ------------------------------------------------------- */

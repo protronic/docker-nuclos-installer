@@ -37,8 +37,10 @@ Das Script fragt alles interaktiv ab – **Enter übernimmt jeweils den Vorschla
 | SQL-Benutzer für Nuclos | Enter (`nuclos_ro`, wird mit `sage100/01-*.sql` angelegt) |
 | Login / Passwort für Verbindungstest | z.B. `sa` + Passwort – oder Passwort leer lassen = Test überspringen |
 | Mandant | Enter (erster gefundener) oder Mandantennummer |
+| tds_fdw einrichten? | `J` (DB-Image wird einmalig mit dem MS-SQL Foreign Data Wrapper gebaut) |
+| Passwort von `nuclos_ro` (User-Mapping) | Passwort aus `sage100/01-*.sql` – oder Enter und später in `sage100-fdw.sql` eintragen |
 
-Der Installer prüft, ob der Sage-Server erreichbar ist, testet auf Wunsch die SQL-Anmeldung (listet Datenbanken und Mandanten auf), lädt den MS-SQL-JDBC-Treiber und startet die Container.
+Der Installer prüft, ob der Sage-Server erreichbar ist, testet auf Wunsch die SQL-Anmeldung (listet Datenbanken und Mandanten auf), baut das DB-Image, startet die Container und führt das FDW-Setup automatisch aus, sobald die Datenbank bereit ist.
 
 ## 3. Ersten Start abwarten
 
@@ -58,21 +60,29 @@ Fertig, sobald der Tomcat-Start durchgelaufen ist bzw. `docker compose ps` den S
 
 ## 5. Sage 100 anbinden
 
-Vorbereitung auf dem Sage-/MS-SQL-Server (einmalig, macht der Sage-/DB-Admin):
+Nuclos-Datenquellen laufen immer gegen die Nuclos-eigene PostgreSQL-DB (externe JDBC-Verbindungen gibt es dafür nicht). Deshalb werden die Sage-Daten per Foreign Data Wrapper `tds_fdw` in die Nuclos-DB geholt – in zwei Schritten:
 
-1. TCP/IP im *SQL Server Configuration Manager* aktivieren, Port 1433; SQL-Server-Authentifizierung (Mixed Mode) einschalten
-2. Firewall: Port 1433 für den Docker-Host freigeben
-3. Die SQL-Skripte aus [`sage100/`](sage100/README.md) in SSMS ausführen: `01` legt den Read-only-Login `nuclos_ro` an (Passwort im Skript anpassen!), `02` erzeugt das Schema `nuclos` mit Views auf Adressen, Kunden, Lieferanten, Artikel und Belege
+**A. Auf dem Sage-/MS-SQL-Server** (einmalig, macht der Sage-/DB-Admin, am besten **vor** der Installation):
 
-Dann in Nuclos (Desktop-Client) unter **Administration → Datenbankverbindungen** eine neue Verbindung anlegen – die Werte gibt der Installer am Ende fertig aus:
+1. TCP/IP im *SQL Server Configuration Manager* aktivieren, Port 1433; SQL-Server-Authentifizierung (Mixed Mode) einschalten; Firewall: Port 1433 für den Docker-Host freigeben
+2. In SSMS ausführen: [`sage100/01-nuclos-readonly-login.sql`](sage100/01-nuclos-readonly-login.sql) (Read-only-Login `nuclos_ro`, Passwort im Skript anpassen!) und [`sage100/02-nuclos-views.sql`](sage100/02-nuclos-views.sql) (Schema `nuclos` mit Views auf Adressen, Kunden, Lieferanten, Artikel, Belege)
 
+**B. In der Nuclos-DB** – macht `install.sh` automatisch, wenn „tds_fdw einrichten“ mit `J` und das Passwort von `nuclos_ro` angegeben wurde. Ergebnis prüfen:
+
+```bash
+ls nuclos-db-exchange/logs/                                   # Protokoll des FDW-Setups
+docker exec -it nuc-db psql -U nuclos -d nuclosdb -c "SELECT count(*) FROM sage.kunden"
 ```
-Treiber-Klasse: com.microsoft.sqlserver.jdbc.SQLServerDriver
-JDBC-URL:       jdbc:sqlserver://<sage-server>:1433;databaseName=OLReweAbf;encrypt=true;trustServerCertificate=true
-Benutzer:       nuclos_ro  (Passwort aus Skript 01)
+
+Ohne Passwort bei der Installation: Passwort in `sage100-fdw.sql` eintragen und `cp sage100-fdw.sql nuclos-db-exchange/` – der DB-Container führt die Datei automatisch aus.
+
+**C. In Nuclos** (Desktop-Client, Konfiguration → Datenquellen): Abfragen aus [`sage100/03-nuclos-datenquellen-beispiele.sql`](sage100/03-nuclos-datenquellen-beispiele.sql) anlegen, z.B.
+
+```sql
+SELECT mandant, kto AS kundennummer, matchcode FROM sage.kunden WHERE mandant = 1
 ```
 
-Der Treiber liegt schon in `nuclos-extensions/server/` und wird beim Serverstart automatisch geladen. Danach unter **Administration → Datenquellen** die Beispiel-Abfragen aus `sage100/03-nuclos-datenquellen-beispiele.sql` anlegen (Mandant einsetzen) und darauf dynamische Entitäten aufbauen – die Sage-Daten stehen dann in Nuclos lesend zur Verfügung.
+und darauf dynamische Entitäten aufbauen. Damit das Schema `sage` versioniert mit dem Nuclet wandert: [`sage100/11-sqlkonfiguration-sage-schema.sql`](sage100/11-sqlkonfiguration-sage-schema.sql) als **SQL-Konfiguration** (Konfiguration → Datenbank → SQL-Konfigurationen, Tag `POSTGRESQL`) anlegen. Details: [sage100/README.md](sage100/README.md)
 
 ## 6. Die wichtigsten Befehle
 
@@ -102,4 +112,5 @@ Tägliches DB-Backup per Cron (2:00 Uhr):
 | Port schon belegt | `install.sh` erneut ausführen und anderen Port wählen, oder `NUCLOS_PORT` in `.env` ändern und `docker compose up -d` |
 | Sage-Server nicht erreichbar | Vom Docker-Host testen: `bash -c 'exec 3<>/dev/tcp/<sage-server>/1433' && echo OK` – schlägt das fehl: Firewall/TCP-IP/Namensauflösung prüfen |
 | DB-Passwort ändern | `secrets/db_password` editieren, dann `docker compose down && docker compose up -d` (wird beim Start automatisch übernommen) |
+| FDW-Setup fehlgeschlagen | Protokoll in `nuclos-db-exchange/logs/` lesen (typisch: Sage-Server nicht erreichbar, Login/Passwort falsch, Skript 02 auf dem Sage-Server noch nicht ausgeführt) – korrigierte `sage100-fdw.sql` erneut nach `nuclos-db-exchange/` kopieren |
 | Produktivbetrieb aus dem Internet | Nur hinter Reverse-Proxy! Beispiel: [Beipiel-NGINX-Config.txt](Beipiel-NGINX-Config.txt) |

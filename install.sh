@@ -8,16 +8,22 @@
 # Erstellt:      Jörg Staub - 15.09.2025
 # Überarbeitet:  09/2026 - Umstellung von "Installer-JAR + eigenem Image-Build"
 #                auf die fertigen nuccess-Images. Zusätzlich Vorbereitung für den
-#                Parallelbetrieb mit Sage 100 / MS-SQL (externe Datenbankverbindung).
+#                Parallelbetrieb mit Sage 100 / MS-SQL (Anbindung per tds_fdw).
 #
 # Wichtig zur Architektur:
 #   - Die nuccess-Images unterstützen als Nuclos-SYSTEMdatenbank ausschließlich
 #     PostgreSQL (Datenbank "nuclosdb", Benutzer "nuclos" sind im Image fest
 #     vorgegeben; nur Schema und Passwort sind konfigurierbar).
-#   - Die Sage-100-Daten (MS-SQL) werden NICHT als Systemdatenbank verwendet,
-#     sondern in Nuclos als EXTERNE Datenbankverbindung (JDBC) eingebunden.
-#     Dieses Script legt dafür den Microsoft-JDBC-Treiber in den
-#     Extensions-Ordner und gibt die fertige JDBC-URL aus.
+#   - Die Sage-100-Daten (MS-SQL) werden NICHT als Systemdatenbank verwendet.
+#     Nuclos kennt für Datenquellen keine externen JDBC-Verbindungen - der
+#     Datenweg läuft über PostgreSQL: der Foreign Data Wrapper tds_fdw bindet
+#     die Sage-Views (Schema "nuclos" auf dem Sage-Server, siehe sage100/) als
+#     Schema "sage" in die Nuclos-DB ein. Dieses Script baut dafür das DB-Image
+#     mit tds_fdw und führt das FDW-Setup (sage100-fdw.sql) automatisch aus.
+#     Das Setup kann zusätzlich als SQL-Konfiguration im Nuclet gepflegt werden
+#     (Konfiguration -> Datenbank -> SQL-Konfigurationen).
+#   - Der Microsoft-JDBC-Treiber in nuclos-extensions/server/ dient nur
+#     Java-Regeln (Server-Code), nicht den Datenquellen.
 #
 # Aufruf:
 #   ./install.sh            normale Installation (Container werden gestartet)
@@ -79,7 +85,8 @@ default_mssql_port=1433
 default_mssql_db=OLReweAbf       # Standard-Datenbankname von Sage 100
 default_mssql_user=nuclos_ro     # Read-only-Login fuer Nuclos (wird mit sage100/01-*.sql angelegt)
 MSSQL_TOOLS_IMAGE=mcr.microsoft.com/mssql-tools:latest  # sqlcmd fuer den Verbindungstest
-MSSQL_JDBC_VERSION=13.6.0.jre11  # Microsoft JDBC-Treiber (Java 11+, passend zu Java 17 im Image)
+MSSQL_JDBC_VERSION=13.6.0.jre11  # Microsoft JDBC-Treiber (nur fuer Java-Regeln; Datenquellen nutzen tds_fdw)
+TDS_FDW_VERSION=v2.0.4           # PostgreSQL Foreign Data Wrapper fuer MS-SQL (https://github.com/tds-fdw/tds_fdw)
 
 # Feste Vorgaben der nuccess-Images (nicht änderbar):
 NUCLOS_DB_NAME=nuclosdb
@@ -283,9 +290,9 @@ done
 
 # Sage 100 / MS-SQL Anbindung ####################################################
 echo "> Sage 100 / MS-SQL -------------------------------------------------------"
-echo "Nuclos läuft parallel zu Sage 100. Die Sage-Datenbank (MS-SQL) wird in"
-echo "Nuclos als externe Datenbankverbindung (JDBC) eingebunden - dafür wird der"
-echo "Microsoft-JDBC-Treiber in den Extensions-Ordner des Servers gelegt."
+echo "Nuclos läuft parallel zu Sage 100. Die Sage-Daten werden lesend per"
+echo "PostgreSQL Foreign Data Wrapper (tds_fdw) in die Nuclos-Datenbank eingebunden;"
+echo "zusätzlich wird der Microsoft-JDBC-Treiber für Java-Regeln abgelegt."
 read -p "Sage 100 / MS-SQL Anbindung vorbereiten? (J/n): " MSSQL_PREP
 MSSQL_PREP=${MSSQL_PREP:-J}
 
@@ -296,6 +303,8 @@ SAGE_MSSQL_USER=""
 SAGE_MSSQL_MANDANT=""
 SAGE_TEST_USER=""
 SAGE_TEST_PASS=""
+TDS_FDW=false
+SAGE_FDW_PASS=""
 if [[ "$MSSQL_PREP" =~ ^[JjYy] ]]; then
   echo "Der MS-SQL-Server (Sage 100) läuft auf einem ANDEREN Server:"
   echo "Hostname oder IP dieses Servers angeben - er muss vom Docker-Host aus"
@@ -347,6 +356,24 @@ if [[ "$MSSQL_PREP" =~ ^[JjYy] ]]; then
       unset SAGE_TEST_PASS
     fi
   fi
+
+  echo ""
+  echo "Datenweg Sage -> Nuclos: PostgreSQL Foreign Data Wrapper (tds_fdw)."
+  echo "Die Sage-Views (Schema 'nuclos' auf dem Sage-Server, Skript sage100/02) werden"
+  echo "als Fremdtabellen im Schema 'sage' der Nuclos-Datenbank eingebunden und stehen"
+  echo "damit in Nuclos-Datenquellen und dynamischen Entitäten direkt zur Verfügung."
+  echo "Dafür wird das Nuclos-DB-Image lokal um tds_fdw erweitert (einmalig, wenige Minuten)."
+  read -p "tds_fdw einrichten? (J/n): " FDW_ANSWER
+  FDW_ANSWER=${FDW_ANSWER:-J}
+  if [[ "$FDW_ANSWER" =~ ^[JjYy] ]]; then
+    TDS_FDW=true
+    if [[ -n "$SAGE_MSSQL_HOST" ]]; then
+      echo "Für das User-Mapping in der Nuclos-DB wird das Passwort von ${SAGE_MSSQL_USER}"
+      echo "benötigt (landet nur in der lokalen Datei sage100-fdw.sql, Rechte 600)."
+      read -s -p "Passwort von ${SAGE_MSSQL_USER} [Enter = später in sage100-fdw.sql eintragen]: " SAGE_FDW_PASS
+      echo ""
+    fi
+  fi
 fi
 
 # Verzeichnisse anlegen ##########################################################
@@ -386,6 +413,8 @@ cat > .gitignore <<'EOF'
 secrets/
 .env
 docker-compose.yml
+nuclos-db.Dockerfile
+sage100-fdw.sql
 logs/
 nuclos-pgdata/
 nuclos-data/
@@ -426,6 +455,9 @@ DB_RAM_GB="${DB_RAM_GB}"
 LIVE_SEARCH="false"
 TZ="${TZ_VALUE}"
 LOCALE="${LOCALE_VALUE}"
+# Nuclos-DB-Image: lokaler Layer auf nuccess/nuclos-db, optional mit tds_fdw (MS-SQL Foreign Data Wrapper)
+TDS_FDW="${TDS_FDW}"
+TDS_FDW_VERSION="${TDS_FDW_VERSION}"
 # Datenbank (durch die nuccess-Images fest vorgegeben)
 # Datenbankname: ${NUCLOS_DB_NAME} / Benutzer: ${NUCLOS_DB_USER}
 # Das DB-Passwort steht NICHT hier, sondern in ./secrets/db_password
@@ -448,6 +480,9 @@ EOF
 #  - Der MS-SQL-Server (Sage 100) läuft auf einem anderen Server und wird über
 #    das normale Netzwerk erreicht. host.docker.internal ist nur der Sonderfall
 #    "MS-SQL läuft auf dem Docker-Host selbst".
+#  - Die DB wird aus nuclos-db.Dockerfile gebaut: ein dünner Layer auf
+#    nuccess/nuclos-db, der bei TDS_FDW=true den Foreign Data Wrapper tds_fdw
+#    für MS-SQL installiert (ohne FDW ist es exakt das Original-Image).
 cat > docker-compose.yml <<'EOF'
 name: ${PREFIX}-nuclos
 
@@ -457,7 +492,14 @@ networks:
 
 services:
   db:
-    image: nuccess/nuclos-db:${NUCLOS_DB_TAG}
+    build:
+      context: .
+      dockerfile: nuclos-db.Dockerfile
+      args:
+        NUCLOS_DB_TAG: ${NUCLOS_DB_TAG}
+        TDS_FDW: ${TDS_FDW}
+        TDS_FDW_VERSION: ${TDS_FDW_VERSION}
+    image: ${PREFIX}-nuclos-db:${NUCLOS_DB_TAG}
     container_name: ${PREFIX}-db
     restart: unless-stopped
     environment:
@@ -519,7 +561,76 @@ services:
       - nuclos-net
 EOF
 
-# MS-SQL JDBC-Treiber für Sage 100 Anbindung #####################################
+# nuclos-db.Dockerfile erzeugen ###################################################
+# Dünner Layer auf dem Original-Image. Bei TDS_FDW=true wird tds_fdw installiert:
+# zuerst als PGDG-Paket versucht, sonst aus den Quellen gebaut (FreeTDS).
+cat > nuclos-db.Dockerfile <<'EOF'
+# Nuclos-DB (nuccess/nuclos-db) + optional tds_fdw (MS-SQL Foreign Data Wrapper)
+# Wird von docker compose aus .env parametrisiert (NUCLOS_DB_TAG, TDS_FDW, TDS_FDW_VERSION)
+ARG NUCLOS_DB_TAG=17.6
+FROM nuccess/nuclos-db:${NUCLOS_DB_TAG}
+ARG TDS_FDW=false
+ARG TDS_FDW_VERSION=v2.0.4
+USER root
+RUN if [ "$TDS_FDW" = "true" ]; then \
+      set -eux; \
+      apt-get update; \
+      if ! apt-get install -y --no-install-recommends "postgresql-${PG_MAJOR}-tds-fdw" freetds-common; then \
+        apt-get install -y --no-install-recommends build-essential ca-certificates git \
+          "postgresql-server-dev-${PG_MAJOR}" freetds-dev freetds-common libsybdb5; \
+        git clone --depth 1 --branch "${TDS_FDW_VERSION}" https://github.com/tds-fdw/tds_fdw.git /tmp/tds_fdw; \
+        make -C /tmp/tds_fdw USE_PGXS=1; \
+        make -C /tmp/tds_fdw USE_PGXS=1 install; \
+        apt-get purge -y --auto-remove build-essential git "postgresql-server-dev-${PG_MAJOR}" freetds-dev; \
+        rm -rf /tmp/tds_fdw; \
+      fi; \
+      rm -rf /var/lib/apt/lists/*; \
+    fi
+USER postgres
+EOF
+
+# sage100-fdw.sql erzeugen (FDW-Setup in der Nuclos-DB) ##########################
+# Wird vom nuclos-db-Container automatisch ausgeführt, sobald die Datei in
+# nuclos-db-exchange/ liegt (psql als Superuser 'nuclos' auf 'nuclosdb').
+if [[ "$TDS_FDW" == "true" ]]; then
+  FDW_HOST=${SAGE_MSSQL_HOST:-<SAGE-SERVER>}
+  FDW_PASS=${SAGE_FDW_PASS:-<PASSWORT>}
+  cat > sage100-fdw.sql <<EOF
+-- Sage 100 -> Nuclos-DB: Foreign Data Wrapper (tds_fdw) einrichten
+-- Erzeugt von install.sh am ${TIMESTAMP}. Enthält das Sage-Passwort - nicht weitergeben!
+-- Ausführung: Datei nach nuclos-db-exchange/ kopieren (wird automatisch ausgeführt
+-- und danach gelöscht; Protokoll in nuclos-db-exchange/logs/).
+CREATE EXTENSION IF NOT EXISTS tds_fdw;
+
+DROP SERVER IF EXISTS sage100 CASCADE;
+CREATE SERVER sage100 FOREIGN DATA WRAPPER tds_fdw
+  OPTIONS (servername '${FDW_HOST}', port '${SAGE_MSSQL_PORT}', database '${SAGE_MSSQL_DB}',
+           tds_version '7.4', msg_handler 'notice');
+
+CREATE USER MAPPING FOR PUBLIC SERVER sage100
+  OPTIONS (username '${SAGE_MSSQL_USER}', password '${FDW_PASS}');
+
+-- Views aus dem Schema "nuclos" des Sage-Servers (sage100/02-nuclos-views.sql)
+-- als Fremdtabellen ins Schema "sage" der Nuclos-DB übernehmen
+DROP SCHEMA IF EXISTS sage CASCADE;
+CREATE SCHEMA sage;
+IMPORT FOREIGN SCHEMA nuclos FROM SERVER sage100 INTO sage;
+
+-- Kontrolle (Ergebnis steht im Protokoll)
+SELECT foreign_table_name FROM information_schema.foreign_tables
+ WHERE foreign_table_schema = 'sage' ORDER BY 1;
+SELECT count(*) AS anzahl_kunden FROM sage.kunden;
+EOF
+  chmod 600 sage100-fdw.sql
+  if [[ -z "$SAGE_FDW_PASS" || -z "$SAGE_MSSQL_HOST" ]]; then
+    echo "ℹ️  sage100-fdw.sql erzeugt - Platzhalter (<SAGE-SERVER>/<PASSWORT>) bitte ergänzen,"
+    echo "   dann: cp sage100-fdw.sql nuclos-db-exchange/  (wird automatisch ausgeführt)"
+  else
+    echo "✅ sage100-fdw.sql erzeugt (wird nach dem Start automatisch ausgeführt)"
+  fi
+fi
+
+# MS-SQL JDBC-Treiber (für Java-Regeln) ##########################################
 if [[ "$MSSQL_PREP" =~ ^[JjYy] ]]; then
   JDBC_JAR="nuclos-extensions/server/mssql-jdbc-${MSSQL_JDBC_VERSION}.jar"
   JDBC_URL="https://repo1.maven.org/maven2/com/microsoft/sqlserver/mssql-jdbc/${MSSQL_JDBC_VERSION}/mssql-jdbc-${MSSQL_JDBC_VERSION}.jar"
@@ -567,13 +678,13 @@ tar -czf "backup-nuclos-data${TIMESTAMP}.tar.gz" ./nuclos-data ./nuclos-extensio
 echo "🧨 Packe Datenbankverzeichnis..."
 tar -czf "backup-nuclos-pgdata${TIMESTAMP}.tar.gz" ./nuclos-pgdata
 echo "🧨 Packe Konfiguration (.env, docker-compose.yml, secrets)..."
-tar -czf "backup-nuclos-config${TIMESTAMP}.tar.gz" .env docker-compose.yml secrets
+tar -czf "backup-nuclos-config${TIMESTAMP}.tar.gz" .env docker-compose.yml nuclos-db.Dockerfile secrets $(ls sage100-fdw.sql 2>/dev/null)
 
 echo "🧹 Entferne lokale Datenverzeichnisse..."
 rm -rf nuclos-pgdata nuclos-data nuclos-extensions nuclos-backups nuclos-db-exchange nuclos-control secrets
 
 echo "🗑️ Entferne Konfigurationsdateien..."
-rm -f .env docker-compose.yml uninstall.sh backup-db.sh backup-instanz.sh restore-instanz.sh upgrade.sh
+rm -f .env docker-compose.yml nuclos-db.Dockerfile sage100-fdw.sql uninstall.sh backup-db.sh backup-instanz.sh restore-instanz.sh upgrade.sh
 
 echo "✅ Nuclos-Docker-Instanz wurde vollständig entfernt."
 echo "   Die backup-*.tar.gz Dateien bleiben zur Sicherheit liegen."
@@ -647,7 +758,7 @@ tar -czf "$BACKUP_DIR/backup-nuclos-data$TIMESTAMP.tar.gz" ./nuclos-data ./nuclo
 echo "🧨 Packe Datenbankverzeichnis..."
 tar -czf "$BACKUP_DIR/backup-nuclos-pgdata$TIMESTAMP.tar.gz" ./nuclos-pgdata
 echo "🧨 Packe Konfiguration (.env, docker-compose.yml, secrets)..."
-tar -czf "$BACKUP_DIR/backup-nuclos-config$TIMESTAMP.tar.gz" .env docker-compose.yml secrets
+tar -czf "$BACKUP_DIR/backup-nuclos-config$TIMESTAMP.tar.gz" .env docker-compose.yml nuclos-db.Dockerfile secrets $(ls sage100-fdw.sql 2>/dev/null)
 
 echo "✅ Nuclos-Docker-Instanz wurde vollständig gesichert."
 
@@ -696,15 +807,16 @@ tar -czf "$BACKUP_DIR/backup-nuclos-data$TIMESTAMP.tar.gz" ./nuclos-data ./nuclo
 echo "🧨 Packe Datenbankverzeichnis..."
 tar -czf "$BACKUP_DIR/backup-nuclos-pgdata$TIMESTAMP.tar.gz" ./nuclos-pgdata
 echo "🧨 Packe Konfiguration (.env, docker-compose.yml, secrets)..."
-tar -czf "$BACKUP_DIR/backup-nuclos-config$TIMESTAMP.tar.gz" .env docker-compose.yml secrets
+tar -czf "$BACKUP_DIR/backup-nuclos-config$TIMESTAMP.tar.gz" .env docker-compose.yml nuclos-db.Dockerfile secrets $(ls sage100-fdw.sql 2>/dev/null)
 
 echo "✅ Backup abgeschlossen."
 
 echo "Setze neuen Nuclos-Server Tag: ${NEW_TAG} ..."
 sed -i "s|^NUCLOS_SERVER_TAG=.*|NUCLOS_SERVER_TAG=\"${NEW_TAG}\"|" .env
 
-echo "Ziehe Images..."
-docker compose pull
+echo "Baue DB-Image (Basis wird aktualisiert) und ziehe Server-Image..."
+docker compose build --pull db
+docker compose pull server
 
 echo "🧨 Starte Container neu (Datenbank-Migration läuft automatisch)..."
 docker compose up -d
@@ -780,6 +892,8 @@ echo "Alle Konfigurationsdateien wurden erfolgreich erzeugt:"
 echo "- .env"
 echo "- docker-compose.yml"
 echo "- secrets/db_password (+ .gitignore-Schutz)"
+echo "- nuclos-db.Dockerfile"
+if [[ "$TDS_FDW" == "true" ]]; then echo "- sage100-fdw.sql"; fi
 echo "- uninstall.sh"
 echo "- backup-db.sh"
 echo "- backup-instanz.sh"
@@ -793,14 +907,59 @@ if [[ $NO_START -eq 1 ]]; then
   echo "   Start später mit: docker compose up -d"
 else
   echo ""
-  echo "Ziehe Docker-Images (nuccess/nuclos-db:${NUCLOS_DB_TAG}, nuccess/nuclos-server:${NUCLOS_SERVER_TAG})..."
-  if ! docker compose pull; then
+  echo "Baue DB-Image (nuccess/nuclos-db:${NUCLOS_DB_TAG}, tds_fdw=${TDS_FDW})..."
+  if ! docker compose build --pull db; then
+      echo "❌ Docker build des DB-Images fehlgeschlagen"
+      exit 1
+  fi
+  echo "Ziehe Server-Image (nuccess/nuclos-server:${NUCLOS_SERVER_TAG})..."
+  if ! docker compose pull server; then
       echo "❌ Docker pull fehlgeschlagen"
       exit 1
   fi
 
   echo "Starte Docker-Container..."
   docker compose up -d
+
+  # FDW-Setup automatisch ausführen, sobald die DB bereit ist
+  if [[ "$TDS_FDW" == "true" && -n "$SAGE_FDW_PASS" && -n "$SAGE_MSSQL_HOST" ]]; then
+    FDW_WAIT_SECONDS=${FDW_WAIT_SECONDS:-180}
+    echo "Warte auf die Datenbank (max. ${FDW_WAIT_SECONDS}s) ..."
+    waited=0
+    until [[ "$(docker inspect -f '{{.State.Health.Status}}' "${PREFIX}-db" 2>/dev/null)" == "healthy" ]]; do
+      sleep 5; waited=$((waited+5))
+      if (( waited >= FDW_WAIT_SECONDS )); then break; fi
+    done
+    if [[ "$(docker inspect -f '{{.State.Health.Status}}' "${PREFIX}-db" 2>/dev/null)" == "healthy" ]]; then
+      echo "Übergebe sage100-fdw.sql an den DB-Container (nuclos-db-exchange/)..."
+      cp sage100-fdw.sql nuclos-db-exchange/sage100-fdw.sql
+      as_root chown 999:1000 nuclos-db-exchange/sage100-fdw.sql || true
+      as_root chmod 640 nuclos-db-exchange/sage100-fdw.sql || true
+      waited=0
+      while [[ -f nuclos-db-exchange/sage100-fdw.sql ]] && (( waited < FDW_WAIT_SECONDS )); do
+        sleep 5; waited=$((waited+5))
+      done
+      FDW_LOG=$(ls -1t nuclos-db-exchange/logs/*sage100-fdw.sql.log 2>/dev/null | head -n1)
+      if [[ -n "$FDW_LOG" ]]; then
+        # Passwort aus dem Protokoll entfernen (der Container protokolliert das komplette SQL)
+        esc=$(printf '%s' "$SAGE_FDW_PASS" | sed 's/[][\\/.*^$&|]/\\&/g')
+        as_root sed -i "s|${esc}|********|g" "$FDW_LOG" || true
+        if grep -q "Error execute" "$FDW_LOG"; then
+          echo "❌ FDW-Setup fehlgeschlagen - Protokoll: $FDW_LOG"
+          grep -iE "ERROR|FEHLER" "$FDW_LOG" | head -n 5 | sed 's/^/   /'
+        else
+          echo "✅ FDW-Setup ausgeführt - Sage-Views stehen als Schema 'sage' in der Nuclos-DB bereit."
+          echo "   Sage-Kunden gesamt (alle Mandanten): $(grep -E "anzahl_kunden" -A2 "$FDW_LOG" | tail -n 1 | tr -d ' ')"
+        fi
+      else
+        echo "⚠️  Noch kein Protokoll des FDW-Setups - später prüfen: ls nuclos-db-exchange/logs/"
+      fi
+    else
+      echo "⚠️  Datenbank nicht rechtzeitig bereit. FDW-Setup später manuell:"
+      echo "   cp sage100-fdw.sql nuclos-db-exchange/"
+    fi
+  fi
+  unset SAGE_FDW_PASS
 
   echo ""
   echo "⏳ Hinweis: Der ERSTE Start dauert mehrere Minuten (automatisches"
@@ -821,33 +980,33 @@ if [[ "$MSSQL_PREP" =~ ^[JjYy] ]]; then
 DISPLAY_MSSQL_HOST=${SAGE_MSSQL_HOST:-"<sage-server>"}
 echo ""
 echo "--- Sage 100 / MS-SQL Anbindung ----------------------------"
-echo "In Nuclos eine externe Datenbankverbindung anlegen"
-echo "(Administration -> Datenbankverbindungen), z.B. für Datenquellen"
-echo "und dynamische Entitäten auf die Sage-100-Daten:"
-echo ""
-echo "  Treiber-Klasse: com.microsoft.sqlserver.jdbc.SQLServerDriver"
-echo "  JDBC-URL:       jdbc:sqlserver://${DISPLAY_MSSQL_HOST}:${SAGE_MSSQL_PORT};databaseName=${SAGE_MSSQL_DB};encrypt=true;trustServerCertificate=true"
-echo "  Benutzer:       ${SAGE_MSSQL_USER:-nuclos_ro}  (Passwort wird beim Anlegen der Verbindung in Nuclos eingegeben)"
+echo "Sage-Server:    ${DISPLAY_MSSQL_HOST}:${SAGE_MSSQL_PORT}  Datenbank: ${SAGE_MSSQL_DB}  Benutzer: ${SAGE_MSSQL_USER:-nuclos_ro}"
 if [[ -n "$SAGE_MSSQL_MANDANT" ]]; then
-echo "  Mandant:        ${SAGE_MSSQL_MANDANT}  (in Datenquellen: WHERE Mandant = ${SAGE_MSSQL_MANDANT})"
+echo "Mandant:        ${SAGE_MSSQL_MANDANT}  (in Datenquellen: WHERE mandant = ${SAGE_MSSQL_MANDANT})"
 fi
 echo ""
-echo "Empfehlung: Sage-seitig einen Read-only-Login und das Schema 'nuclos' mit"
-echo "Views auf Adressen, Kunden, Artikel und Belege anlegen - fertige SQL-Skripte"
-echo "und Datenquellen-Beispiele im Ordner sage100/ des Repos:"
-echo "  https://github.com/protronic/docker-nuclos-installer/tree/main/sage100"
+echo "1) Auf dem Sage-Server (einmalig, SSMS): sage100/01-nuclos-readonly-login.sql"
+echo "   (Login ${SAGE_MSSQL_USER:-nuclos_ro}) und sage100/02-nuclos-views.sql (Schema 'nuclos' mit Views)"
+echo "   https://github.com/protronic/docker-nuclos-installer/tree/main/sage100"
+if [[ "$TDS_FDW" == "true" ]]; then
+echo "2) In der Nuclos-DB: tds_fdw bindet diese Views als Schema 'sage' ein"
+echo "   (sage100-fdw.sql; automatisch ausgeführt bzw. nach nuclos-db-exchange/ kopieren)."
+echo "   In Nuclos-Datenquellen dann z.B.:  SELECT kto, matchcode FROM sage.kunden WHERE mandant = ${SAGE_MSSQL_MANDANT:-1}"
+echo "3) Optional dauerhaft als SQL-Konfiguration im Nuclet pflegen"
+echo "   (Konfiguration -> Datenbank -> SQL-Konfigurationen, Tag POSTGRESQL): sage100/11-*.sql"
+else
+echo "2) tds_fdw wurde nicht eingerichtet - Sage-Daten sind in Nuclos nur per Java-Regel"
+echo "   (JDBC-Treiber in nuclos-extensions/server/) erreichbar. Nachrüsten: TDS_FDW=true"
+echo "   in .env, ./upgrade.sh, dann sage100-fdw.sql nach nuclos-db-exchange/ kopieren."
+fi
 echo ""
 echo "Voraussetzungen auf dem Sage/MS-SQL-Server:"
 echo "  - TCP/IP im SQL Server Configuration Manager aktiviert (Port ${SAGE_MSSQL_PORT})"
-echo "  - SQL-Server-Authentifizierung (Mixed Mode) + eigener Login,"
-echo "    empfohlen nur mit Lesezugriff (db_datareader) auf die Sage-DB"
+echo "  - SQL-Server-Authentifizierung (Mixed Mode); ${SAGE_MSSQL_USER:-nuclos_ro} nur lesend (Skript 01)"
 echo "  - Firewall: der Docker-Host muss ${DISPLAY_MSSQL_HOST}:${SAGE_MSSQL_PORT} erreichen"
 if [[ "$SAGE_MSSQL_HOST" == "host.docker.internal" ]]; then
 echo "  - 'host.docker.internal' zeigt auf den Docker-Host (MS-SQL läuft dort)"
 fi
-echo ""
-echo "Der JDBC-Treiber liegt in ./nuclos-extensions/server/ und wird beim"
-echo "Serverstart automatisch geladen."
 fi
 echo ""
 echo "------------------------------------------------------------"

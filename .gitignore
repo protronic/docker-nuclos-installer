@@ -2,6 +2,8 @@
 secrets/
 .env
 docker-compose.yml
+nuclos-db.Dockerfile
+sage100-fdw.sql
 logs/
 nuclos-pgdata/
 nuclos-data/

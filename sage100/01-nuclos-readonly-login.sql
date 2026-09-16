@@ -5,8 +5,9 @@
    Ausführen auf dem Sage-100-SQL-Server (SSMS oder sqlcmd) mit
    sysadmin-Rechten. Vorher anpassen:
      - Datenbankname  (Standard OLReweAbf) -> DEFAULT_DATABASE und "USE"
-     - Passwort       (BitteAendern-2026!)  -> gleiches Passwort später in
-                                              Nuclos bei der Datenbankverbindung
+     - Passwort       (BitteAendern-2026!)  -> dasselbe Passwort wird beim
+                                              FDW-Setup (install.sh / sage100-fdw.sql)
+                                              für das User-Mapping abgefragt
 
    Der Login bekommt AUSSCHLIESSLICH Leserechte auf das Schema "nuclos"
    und keinen direkten Zugriff auf die Sage-Rohtabellen (Schema dbo).
