@@ -75,7 +75,6 @@ default_ram_server=4
 default_ram_db=2
 default_tz=Europe/Berlin
 default_locale=de_DE.UTF-8
-default_mssql_host=host.docker.internal
 default_mssql_port=1433
 default_mssql_db=SageDB
 MSSQL_JDBC_VERSION=13.6.0.jre11  # Microsoft JDBC-Treiber (Java 11+, passend zu Java 17 im Image)
@@ -240,14 +239,31 @@ SAGE_MSSQL_HOST=""
 SAGE_MSSQL_PORT=""
 SAGE_MSSQL_DB=""
 if [[ "$MSSQL_PREP" =~ ^[JjYy] ]]; then
-  echo "Läuft der MS-SQL-Server auf DIESEM Host, 'host.docker.internal' verwenden,"
-  echo "sonst Hostname/IP des Sage-100-Servers angeben."
-  read -p "MS-SQL Host [Enter für $default_mssql_host]: " SAGE_MSSQL_HOST
-  SAGE_MSSQL_HOST=${SAGE_MSSQL_HOST:-$default_mssql_host}
+  echo "Der MS-SQL-Server (Sage 100) läuft auf einem ANDEREN Server:"
+  echo "Hostname oder IP dieses Servers angeben - er muss vom Docker-Host aus"
+  echo "über den MS-SQL-Port erreichbar sein (Firewall!)."
+  echo "(Sonderfall: läuft MS-SQL doch auf dem Docker-Host selbst,"
+  echo " 'host.docker.internal' eintragen.)"
+  read -p "MS-SQL Host (Hostname/IP des Sage-100-Servers): " SAGE_MSSQL_HOST
   read -p "MS-SQL Port [Enter für $default_mssql_port]: " SAGE_MSSQL_PORT
   SAGE_MSSQL_PORT=${SAGE_MSSQL_PORT:-$default_mssql_port}
   read -p "Sage 100 Datenbankname [Enter für $default_mssql_db]: " SAGE_MSSQL_DB
   SAGE_MSSQL_DB=${SAGE_MSSQL_DB:-$default_mssql_db}
+
+  if [[ -z "$SAGE_MSSQL_HOST" ]]; then
+    echo "ℹ️  Kein Host angegeben - die Verbindungsdaten können später direkt"
+    echo "   in Nuclos hinterlegt werden."
+  elif [[ "$SAGE_MSSQL_HOST" != "host.docker.internal" ]]; then
+    echo "Prüfe Erreichbarkeit von ${SAGE_MSSQL_HOST}:${SAGE_MSSQL_PORT} ..."
+    if timeout 5 bash -c "exec 3<>/dev/tcp/${SAGE_MSSQL_HOST}/${SAGE_MSSQL_PORT} && exec 3>&-" 2>/dev/null; then
+      echo "✅ ${SAGE_MSSQL_HOST}:${SAGE_MSSQL_PORT} ist vom Docker-Host aus erreichbar."
+    else
+      echo "⚠️  ${SAGE_MSSQL_HOST}:${SAGE_MSSQL_PORT} ist aktuell NICHT erreichbar."
+      echo "   Bitte prüfen: Firewall-Freigabe vom Docker-Host, TCP/IP im"
+      echo "   SQL Server Configuration Manager, Namensauflösung."
+      echo "   (Die Installation läuft trotzdem weiter.)"
+    fi
+  fi
 fi
 
 # Verzeichnisse anlegen ##########################################################
@@ -277,6 +293,37 @@ printf '%s' "$DB_PASSWORD" > secrets/db_password
 as_root chown -R 999:1000 secrets || true
 as_root chmod 750 secrets || true
 as_root chmod 640 secrets/db_password || true
+
+# .gitignore erzeugen ############################################################
+# Falls das Installationsverzeichnis (auch) ein Git-Repo ist: Secrets,
+# Laufzeitdaten und generierte Dateien dürfen niemals eingecheckt werden.
+if [[ ! -f .gitignore ]]; then
+cat > .gitignore <<'EOF'
+# Von install.sh erzeugte Dateien und Laufzeitdaten - niemals committen!
+secrets/
+.env
+docker-compose.yml
+logs/
+nuclos-pgdata/
+nuclos-data/
+nuclos-extensions/
+nuclos-backups/
+nuclos-db-backups/
+nuclos-db-exchange/
+nuclos-control/
+nuclos-instanzbackup/
+nuclos-archiv/
+backup-*.tar.gz
+*.backup
+# generierte Hilfsscripte
+uninstall.sh
+backup-db.sh
+backup-instanz.sh
+restore-instanz.sh
+upgrade.sh
+EOF
+echo "Erzeuge .gitignore (Secrets/Laufzeitdaten vom Einchecken ausgeschlossen)"
+fi
 
 # .env erzeugen ##################################################################
 cat > .env <<EOF
@@ -313,7 +360,9 @@ EOF
 #  - /var/nuclos-db ist das gemeinsame Austauschverzeichnis von Server und DB
 #    (Schema-Anlage, DockerBackup/DockerRestore) und MUSS geteilt werden.
 #  - Der PostgreSQL-Port wird bewusst NICHT am Host veröffentlicht.
-#  - host.docker.internal zeigt auf den Docker-Host (z.B. dort laufender MS-SQL).
+#  - Der MS-SQL-Server (Sage 100) läuft auf einem anderen Server und wird über
+#    das normale Netzwerk erreicht. host.docker.internal ist nur der Sonderfall
+#    "MS-SQL läuft auf dem Docker-Host selbst".
 cat > docker-compose.yml <<'EOF'
 name: ${PREFIX}-nuclos
 
@@ -645,7 +694,7 @@ echo ""
 echo "Alle Konfigurationsdateien wurden erfolgreich erzeugt:"
 echo "- .env"
 echo "- docker-compose.yml"
-echo "- secrets/db_password"
+echo "- secrets/db_password (+ .gitignore-Schutz)"
 echo "- uninstall.sh"
 echo "- backup-db.sh"
 echo "- backup-instanz.sh"
@@ -684,6 +733,7 @@ echo "Desktop-Client:     nuclos://<server-ip>:${NUCLOS_PORT}/nuclos"
 echo "Standard-Benutzer:  nuclos (leeres Passwort) -> nach dem ersten"
 echo "                    Login unbedingt Passwort setzen!"
 if [[ "$MSSQL_PREP" =~ ^[JjYy] ]]; then
+DISPLAY_MSSQL_HOST=${SAGE_MSSQL_HOST:-"<sage-server>"}
 echo ""
 echo "--- Sage 100 / MS-SQL Anbindung ----------------------------"
 echo "In Nuclos eine externe Datenbankverbindung anlegen"
@@ -691,15 +741,17 @@ echo "(Administration -> Datenbankverbindungen), z.B. für Datenquellen"
 echo "und dynamische Entitäten auf die Sage-100-Daten:"
 echo ""
 echo "  Treiber-Klasse: com.microsoft.sqlserver.jdbc.SQLServerDriver"
-echo "  JDBC-URL:       jdbc:sqlserver://${SAGE_MSSQL_HOST}:${SAGE_MSSQL_PORT};databaseName=${SAGE_MSSQL_DB};encrypt=true;trustServerCertificate=true"
+echo "  JDBC-URL:       jdbc:sqlserver://${DISPLAY_MSSQL_HOST}:${SAGE_MSSQL_PORT};databaseName=${SAGE_MSSQL_DB};encrypt=true;trustServerCertificate=true"
 echo "  Benutzer:       <SQL-Login mit Lesezugriff auf die Sage-DB>"
 echo ""
 echo "Voraussetzungen auf dem Sage/MS-SQL-Server:"
 echo "  - TCP/IP im SQL Server Configuration Manager aktiviert (Port ${SAGE_MSSQL_PORT})"
 echo "  - SQL-Server-Authentifizierung (Mixed Mode) + eigener Login,"
 echo "    empfohlen nur mit Lesezugriff (db_datareader) auf die Sage-DB"
-echo "  - Firewall-Freigabe für Port ${SAGE_MSSQL_PORT} vom Docker-Host"
-echo "  - Bei 'host.docker.internal' muss MS-SQL auf dem Docker-Host laufen"
+echo "  - Firewall: der Docker-Host muss ${DISPLAY_MSSQL_HOST}:${SAGE_MSSQL_PORT} erreichen"
+if [[ "$SAGE_MSSQL_HOST" == "host.docker.internal" ]]; then
+echo "  - 'host.docker.internal' zeigt auf den Docker-Host (MS-SQL läuft dort)"
+fi
 echo ""
 echo "Der JDBC-Treiber liegt in ./nuclos-extensions/server/ und wird beim"
 echo "Serverstart automatisch geladen."

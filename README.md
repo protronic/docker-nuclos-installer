@@ -19,19 +19,21 @@ Ausgelegt für den **Parallelbetrieb mit Sage 100 / MS-SQL**: Nuclos läuft in D
 
 ## Architektur / Parallelbetrieb mit Sage 100 und MS-SQL
 
+Sage 100 und der MS-SQL-Server laufen auf einem **eigenen Server**, Nuclos in Docker auf dem Docker-Host daneben:
+
 ```
-┌────────────────────────── Server ──────────────────────────┐
-│                                                            │
-│  Sage 100 ──── MS-SQL Server (Port 1433)                   │
-│                     ▲                                      │
-│                     │ externe DB-Verbindung (JDBC,         │
-│                     │ nur lesend empfohlen)                │
-│  Docker:            │                                      │
-│  ┌──────────────────┴─────┐   ┌─────────────────────────┐  │
-│  │ nuccess/nuclos-server  │──▶│ nuccess/nuclos-db       │  │
-│  │ (Port 8080 → Host)     │   │ (PostgreSQL, nur intern)│  │
-│  └────────────────────────┘   └─────────────────────────┘  │
-└────────────────────────────────────────────────────────────┘
+┌───── Sage-100-Server ─────┐             ┌────────────── Docker-Host ──────────────┐
+│                           │             │                                         │
+│  Sage 100                 │    JDBC     │  ┌───────────────────────┐              │
+│  MS-SQL Server (1433) ◀───┼─────────────┼──│ nuccess/nuclos-server │              │
+│                           │ (nur lesend │  │ (Port 8080 → Host)    │              │
+└───────────────────────────┘  empfohlen) │  └───────────┬───────────┘              │
+                                          │              ▼                          │
+                                          │  ┌───────────────────────┐              │
+                                          │  │ nuccess/nuclos-db     │              │
+                                          │  │ (PostgreSQL, intern)  │              │
+                                          │  └───────────────────────┘              │
+                                          └─────────────────────────────────────────┘
 ```
 
 Wichtig zu wissen:
@@ -39,10 +41,10 @@ Wichtig zu wissen:
 - Die nuccess-Images unterstützen als **Nuclos-Systemdatenbank ausschließlich PostgreSQL**. Datenbankname (`nuclosdb`) und Benutzer (`nuclos`) sind im Image fest vorgegeben; konfigurierbar sind Schema und Passwort. Die Sage-100/MS-SQL-Datenbank kann und soll **nicht** als Systemdatenbank dienen.
 - Die **Sage-100-Daten** werden in Nuclos über eine **externe Datenbankverbindung** eingebunden (Administration → Datenbankverbindungen) und stehen dann z.B. für Datenquellen und dynamische Entitäten zur Verfügung:
   - Treiber-Klasse: `com.microsoft.sqlserver.jdbc.SQLServerDriver`
-  - JDBC-URL: `jdbc:sqlserver://<host>:1433;databaseName=<SageDB>;encrypt=true;trustServerCertificate=true`
-  - Läuft MS-SQL auf dem Docker-Host selbst: als Host `host.docker.internal` verwenden (ist in der erzeugten `docker-compose.yml` bereits eingerichtet).
+  - JDBC-URL: `jdbc:sqlserver://<sage-server>:1433;databaseName=<SageDB>;encrypt=true;trustServerCertificate=true`
+- **Netzwerk:** Der Docker-Host muss den Sage-100-Server auf Port 1433 erreichen (Firewall-Freigabe, Namensauflösung). `install.sh` prüft die Erreichbarkeit direkt bei der Installation. Sonderfall: läuft MS-SQL doch auf dem Docker-Host selbst, als Host `host.docker.internal` verwenden (in der erzeugten `docker-compose.yml` bereits eingerichtet).
 - Voraussetzungen auf dem MS-SQL-Server: TCP/IP aktiviert (SQL Server Configuration Manager), Port 1433 in der Firewall freigegeben, SQL-Server-Authentifizierung (Mixed Mode) mit eigenem Login – empfohlen **nur Lesezugriff** (`db_datareader`) auf die Sage-Datenbank.
-- **Keine Portkonflikte:** Nuclos belegt einen freien HTTP-Port ab 8080, der PostgreSQL-Container wird nicht am Host veröffentlicht, MS-SQL (1433) bleibt unberührt.
+- **Keine Portkonflikte:** Nuclos belegt einen freien HTTP-Port ab 8080, der PostgreSQL-Container wird nicht am Host veröffentlicht, der Sage-Server bleibt unberührt.
 
 ## Installation
 
@@ -71,6 +73,7 @@ Danach erreichbar unter:
 | `.env` | Zentrale Konfiguration (Tags, Port, Schema, RAM, Sage-Parameter) |
 | `docker-compose.yml` | Compose-Stack (db + server) |
 | `secrets/db_password` | Datenbank-Passwort (Secret-Datei, nicht in `.env`!) |
+| `.gitignore` | Wird miterzeugt: Secrets, `.env` und alle Laufzeitdaten sind vom Einchecken ausgeschlossen |
 | `nuclos-pgdata/` | PostgreSQL-Daten |
 | `nuclos-data/` | Dokumente, Suchindex, Logs, Nuclet-Autoimport |
 | `nuclos-extensions/server/` | Server-Extensions, u.a. der MS-SQL JDBC-Treiber |

@@ -1,0 +1,22 @@
+# Von install.sh erzeugte Dateien und Laufzeitdaten - niemals committen!
+secrets/
+.env
+docker-compose.yml
+logs/
+nuclos-pgdata/
+nuclos-data/
+nuclos-extensions/
+nuclos-backups/
+nuclos-db-backups/
+nuclos-db-exchange/
+nuclos-control/
+nuclos-instanzbackup/
+nuclos-archiv/
+backup-*.tar.gz
+*.backup
+# generierte Hilfsscripte
+uninstall.sh
+backup-db.sh
+backup-instanz.sh
+restore-instanz.sh
+upgrade.sh
